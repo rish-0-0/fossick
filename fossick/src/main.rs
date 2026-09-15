@@ -1,9 +1,10 @@
-use fossick::{conf::Conf, search, serve, tstamp};
+use fossick::{conf::Conf, loggen, search, serve, tstamp};
 use std::process::exit;
 
 const USAGE: &str = "usage:
   fossick serve  [--conf <path>]
   fossick search \"<query>\" [--conf <path>]
+  fossick loggen --port <p> --count <n>
 
 query: bare terms (substring match), field=value, earliest=/latest= (-15m, now, ISO, epoch)
 conf resolution: --conf, else $FOSSICK_CONF, else ./fossick.conf, else built-in defaults";
@@ -36,13 +37,24 @@ fn main() {
     let cmd = args.next().unwrap_or_default();
     let mut positional = Vec::new();
     let mut conf_path = None;
+    let (mut port, mut count) = (0u16, 0u64);
     while let Some(a) = args.next() {
-        if a == "--conf" {
-            conf_path = args.next();
-            if conf_path.is_none() {
-                eprintln!("fossick: --conf needs a path");
-                exit(2);
+        let mut flag = |name: &str| -> Option<String> {
+            if a == name {
+                args.next().or_else(|| {
+                    eprintln!("fossick: {name} needs a value");
+                    exit(2);
+                })
+            } else {
+                None
             }
+        };
+        if let Some(v) = flag("--conf") {
+            conf_path = Some(v);
+        } else if let Some(v) = flag("--port") {
+            port = v.parse().unwrap_or(0);
+        } else if let Some(v) = flag("--count") {
+            count = v.parse().unwrap_or(0);
         } else {
             positional.push(a);
         }
@@ -63,6 +75,13 @@ fn main() {
                 println!("{}  {}", tstamp::to_iso(ev.time_ms), String::from_utf8_lossy(&ev.raw));
             })
             .map(|hits| eprintln!("{hits} events"))
+        }
+        "loggen" => {
+            if port == 0 || count == 0 {
+                eprintln!("fossick: loggen needs --port and --count");
+                exit(2);
+            }
+            loggen::run(port, count)
         }
         _ => {
             eprintln!("{USAGE}");

@@ -50,11 +50,12 @@ fn matches(q: &Query, ev: &OwnedEvent, field_ids: &[Option<u8>]) -> bool {
             return false;
         }
     }
-    if !q.terms.is_empty() {
-        let raw = ev.raw.to_ascii_lowercase();
-        return q.terms.iter().all(|t| raw.windows(t.len().max(1)).any(|w| w == t.as_bytes()));
-    }
-    true
+    q.terms.iter().all(|t| contains_ci(&ev.raw, t.as_bytes()))
+}
+
+/// Case-insensitive (ASCII) substring test without allocating.
+fn contains_ci(hay: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && hay.windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle))
 }
 
 /// Stream matching events, newest bucket first, to `emit(event, field_names)`.

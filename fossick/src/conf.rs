@@ -60,6 +60,7 @@ fn bad(line_no: usize, msg: String) -> io::Error {
 
 impl Conf {
     pub fn parse(text: &str) -> io::Result<Conf> {
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text); // tolerate UTF-8 BOM
         let mut c = Conf::default();
         c.inputs.clear(); // config-defined inputs replace the default
         let mut section = String::from("general");
@@ -154,6 +155,12 @@ mod tests {
         for text in ["[general]\ndata_dirr = x\n", "[bucket]\nhot = 1\n", "[nope]\n", "[input:tcp:1]\nfoo = 1\n"] {
             assert!(Conf::parse(text).is_err(), "{text}");
         }
+    }
+
+    #[test]
+    fn tolerates_utf8_bom() {
+        let c = Conf::parse("\u{feff}[bucket]\nhot_max_mb = 7\n").unwrap();
+        assert_eq!(c.hot_max_mb, 7);
     }
 
     #[test]

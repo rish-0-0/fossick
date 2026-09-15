@@ -109,7 +109,10 @@ impl HotBucket {
             self.tbl.sync_data()?;
             self.blocks_since_sync = 0;
         }
-        self.man.write(&self.dir)
+        // The manifest is NOT rewritten here: hot-bucket counts are only
+        // advisory (recovery rebuilds them from the journal), and skipping
+        // the rewrite saves an fsync per block flush.
+        Ok(())
     }
 }
 
@@ -490,13 +493,13 @@ mod tests {
     }
 
     #[test]
-    fn manifest_tracks_counts_and_span() {
+    fn manifest_tracks_counts_and_span_after_seal() {
         let data = tmp();
         let mut b = HotBucket::create(&data, 2, fields()).unwrap();
         b.add_event(500, &[], b"a").unwrap();
         b.add_event(100, &[], b"b").unwrap();
-        b.flush().unwrap();
-        let m = Manifest::read(&b.dir).unwrap();
+        let dir = b.finalize().unwrap();
+        let m = Manifest::read(&dir).unwrap();
         assert_eq!((m.event_count, m.min_time_ms, m.max_time_ms), (2, 100, 500));
     }
 
