@@ -1,0 +1,8 @@
+[package]
+name = "fossick-spl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+regex = "1"

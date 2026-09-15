@@ -1,0 +1,9 @@
+[package]
+name = "fossick-index"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+zstd = "0.13"
+memmap2 = "0.9"

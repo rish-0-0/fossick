@@ -1,0 +1,9 @@
+[package]
+name = "fossick"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fossick-index = { path = "../fossick-index" }
+fossick-spl = { path = "../fossick-spl" }
