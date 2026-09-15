@@ -3,7 +3,7 @@
 
 use crate::conf::{Conf, TcpInput};
 use crate::tstamp;
-use fossick_index::bucket::HotBucket;
+use fossick_index::bucket::{HotBucket, RollLimits};
 use std::io::{self, Read};
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
@@ -140,11 +140,22 @@ fn send_line(
     .map_err(|_| ())
 }
 
-/// Single-writer indexer loop; flushes the hot bucket at least every second.
+/// Single-writer indexer loop; flushes the hot bucket at least every second,
+/// recovers orphaned hot buckets at startup, rolls hot→warm at the limits.
 pub fn run_indexer(conf: &Conf, rx: Receiver<IngestEvent>) -> io::Result<()> {
+    for b in fossick_index::list_buckets(&conf.data_dir)? {
+        if b.hot {
+            fossick_index::bucket::recover_hot_dir(&b.dir)?;
+        }
+    }
+    let limits = RollLimits {
+        max_bytes: conf.hot_max_mb * 1024 * 1024,
+        max_events: conf.hot_max_events,
+        max_span_ms: conf.hot_max_hours * 3_600_000,
+    };
     let fields = base_fields(conf);
     let id = fossick_index::list_buckets(&conf.data_dir)?.iter().map(|b| b.id + 1).max().unwrap_or(0);
-    let mut hot = HotBucket::create(&conf.data_dir, id, fields)?;
+    let mut hot = HotBucket::create(&conf.data_dir, id, fields.clone())?;
     let time_source_id = (3 + conf.indexed_fields.len()) as u8;
     loop {
         match rx.recv_timeout(FLUSH_EVERY) {
@@ -163,6 +174,11 @@ pub fn run_indexer(conf: &Conf, rx: Receiver<IngestEvent>) -> io::Result<()> {
                     metas.push((time_source_id, b"receipt"));
                 }
                 hot.add_event(ev.time_ms, &metas, &ev.raw)?;
+                if hot.should_roll(&limits) {
+                    let next_id = hot.man.id + 1;
+                    let full = std::mem::replace(&mut hot, HotBucket::create(&conf.data_dir, next_id, fields.clone())?);
+                    full.finalize()?;
+                }
             }
             Err(RecvTimeoutError::Timeout) => hot.flush()?,
             Err(RecvTimeoutError::Disconnected) => return hot.flush(),

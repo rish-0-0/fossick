@@ -5,7 +5,7 @@
 //! so readers can address blocks before the trailer exists. An event address packs
 //! `(block_no << 32) | offset_in_block`.
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
@@ -188,20 +188,43 @@ impl JournalWriter {
     /// Flush, write the block index table + trailer, drop the sidecar.
     pub fn finalize(mut self) -> io::Result<()> {
         self.flush_block()?;
-        let table_offset = self.file_len;
-        for e in &self.blocks {
-            self.file.write_all(&e.encode())?;
-        }
-        let mut tr = [0u8; 16];
-        tr[0..4].copy_from_slice(&(self.blocks.len() as u32).to_le_bytes());
-        tr[4..12].copy_from_slice(&table_offset.to_le_bytes());
-        tr[12..16].copy_from_slice(MAGIC_END);
-        self.file.write_all(&tr)?;
-        self.file.sync_all()?;
+        write_trailer(&mut self.file, &self.blocks, self.file_len)?;
         drop(self.bidx);
-        std::fs::remove_file(self.dir.join("journal.zj.bidx"))?;
-        Ok(())
+        std::fs::remove_file(self.dir.join("journal.zj.bidx"))
     }
+}
+
+fn write_trailer(file: &mut File, blocks: &[BlockEntry], table_offset: u64) -> io::Result<()> {
+    for e in blocks {
+        file.write_all(&e.encode())?;
+    }
+    let mut tr = [0u8; 16];
+    tr[0..4].copy_from_slice(&(blocks.len() as u32).to_le_bytes());
+    tr[4..12].copy_from_slice(&table_offset.to_le_bytes());
+    tr[12..16].copy_from_slice(MAGIC_END);
+    file.write_all(&tr)?;
+    file.sync_all()
+}
+
+/// Crash recovery for a hot journal: rebuild the trailer from the bidx
+/// sidecar, discarding any partially-written final block. No-op if the
+/// journal is already finalized. Returns the recovered block entries.
+pub fn recover(dir: &Path) -> io::Result<Vec<BlockEntry>> {
+    let side_path = dir.join("journal.zj.bidx");
+    if !side_path.exists() {
+        return Ok(JournalReader::open(dir)?.blocks); // already finalized
+    }
+    let mut side = Vec::new();
+    File::open(&side_path)?.read_to_end(&mut side)?;
+    let blocks: Vec<BlockEntry> =
+        side.chunks_exact(ENTRY_LEN).map(BlockEntry::decode).collect();
+    let end = blocks.last().map(|e| e.file_offset + e.comp_len as u64).unwrap_or(16);
+    let mut file = OpenOptions::new().read(true).write(true).open(dir.join("journal.zj"))?;
+    file.set_len(end)?; // drop a torn final block, if any
+    file.seek(SeekFrom::End(0))?;
+    write_trailer(&mut file, &blocks, end)?;
+    std::fs::remove_file(&side_path)?;
+    Ok(blocks)
 }
 
 pub struct JournalReader {

@@ -74,6 +74,35 @@ fn ingest_and_search_roundtrip() {
 }
 
 #[test]
+fn rollover_produces_warm_buckets_and_search_spans_them() {
+    let mut conf = test_conf("rollover");
+    conf.hot_max_events = 100;
+    let input = TcpInput { port: 0, source: "s".into(), sourcetype: "app".into(), host: "h".into() };
+    let lines: Vec<String> = (0..550)
+        .map(|i| format!("2026-09-15T{:02}:{:02}:{:02}Z roll_needle event {i}", 8 + i / 3600, i / 60 % 60, i % 60))
+        .collect();
+    ingest(&conf, input.clone(), None, &lines);
+
+    let buckets = fossick_index::list_buckets(&conf.data_dir).unwrap();
+    let warm: Vec<_> = buckets.iter().filter(|b| !b.hot).collect();
+    assert_eq!(warm.len(), 5, "550 events at 100/bucket → 5 warm rolls");
+    assert!(buckets.iter().any(|b| b.hot), "remainder stays hot");
+    for w in &warm {
+        assert!(w.min_time_ms <= w.max_time_ms && w.min_time_ms > 0, "db_ name carries time span");
+    }
+    let now = tstamp::now_ms();
+    assert_eq!(search::collect(&conf.data_dir, "roll_needle", now).unwrap().len(), 550);
+
+    // Restart: a second indexer run must recover the leftover hot bucket to warm.
+    let (tx, rx) = std::sync::mpsc::channel::<serve::IngestEvent>();
+    drop(tx);
+    serve::run_indexer(&conf, rx).unwrap();
+    let after = fossick_index::list_buckets(&conf.data_dir).unwrap();
+    assert_eq!(after.iter().filter(|b| !b.hot).count(), 6);
+    assert_eq!(search::collect(&conf.data_dir, "roll_needle", now).unwrap().len(), 550);
+}
+
+#[test]
 fn fossick_header_overrides_metadata() {
     let conf = test_conf("header");
     let input = TcpInput { port: 0, source: "tcp:0".into(), sourcetype: "default".into(), host: "x".into() };
