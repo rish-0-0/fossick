@@ -7,6 +7,8 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Conf {
     pub data_dir: PathBuf,
+    /// Search REST API port on 127.0.0.1; 0 disables.
+    pub api_port: u16,
     pub hot_max_mb: u64,
     pub hot_max_events: u64,
     pub hot_max_hours: u64,
@@ -38,6 +40,7 @@ impl Default for Conf {
     fn default() -> Conf {
         Conf {
             data_dir: PathBuf::from("fossick-data"),
+            api_port: 8089,
             hot_max_mb: 270,
             hot_max_events: 4_000_000,
             hot_max_hours: 24,
@@ -86,6 +89,7 @@ impl Conf {
             let num = |v: &str| v.parse::<u64>().map_err(|_| bad(n, format!("bad number for {k}: {v}")));
             match (section.as_str(), k) {
                 ("general", "data_dir") => c.data_dir = PathBuf::from(v),
+                ("general", "api_port") => c.api_port = num(v)? as u16,
                 ("bucket", "hot_max_mb") => c.hot_max_mb = num(v)?,
                 ("bucket", "hot_max_events") => c.hot_max_events = num(v)?,
                 ("bucket", "hot_max_hours") => c.hot_max_hours = num(v)?,

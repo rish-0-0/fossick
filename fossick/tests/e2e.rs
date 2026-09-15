@@ -179,6 +179,46 @@ fn unparseable_timestamp_gets_receipt_time_and_marker() {
 }
 
 #[test]
+fn rest_api_streams_ndjson_results() {
+    use std::io::Read;
+    let conf = test_conf("http");
+    let input = TcpInput { port: 0, source: "s".into(), sourcetype: "app".into(), host: "web01".into() };
+    let lines: Vec<String> =
+        (0..50).map(|i| format!("2026-09-15T10:00:{:02}Z api_needle_{} msg=\"q{i}\"", i % 60, i % 5)).collect();
+    ingest(&conf, input, None, &lines);
+
+    let api = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = api.local_addr().unwrap().port();
+    fossick::http::spawn(api, conf.data_dir.clone());
+
+    let get = |target: &str| -> (String, String) {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        write!(s, "GET {target} HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        let mut resp = String::new();
+        s.read_to_string(&mut resp).unwrap();
+        let (head, body) = resp.split_once("\r\n\r\n").unwrap();
+        (head.to_string(), body.to_string())
+    };
+
+    let (head, body) = get("/search?q=api_needle_2+sourcetype%3Dapp");
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(head.contains("application/x-ndjson"));
+    let events: Vec<&str> = body.lines().collect();
+    assert_eq!(events.len(), 10);
+    for e in &events {
+        assert!(e.starts_with("{\"_time\":\"2026-09-15T10:00:"), "{e}");
+        assert!(e.contains("\"sourcetype\":\"app\"") && e.contains("\"host\":\"web01\""));
+        assert!(e.contains("api_needle_2") && e.contains("msg=\\\"q"));
+    }
+
+    let (head, body) = get("/health");
+    assert!(head.starts_with("HTTP/1.1 200"));
+    assert_eq!(body, "ok\n");
+    assert!(get("/nope").0.starts_with("HTTP/1.1 404"));
+    assert!(get("/search?q=earliest%3Djunk").0.starts_with("HTTP/1.1 400"));
+}
+
+#[test]
 fn crlf_blank_lines_and_no_trailing_newline() {
     let conf = test_conf("framing");
     let input = TcpInput { port: 0, source: "s".into(), sourcetype: "st".into(), host: "h".into() };

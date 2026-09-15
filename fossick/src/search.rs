@@ -68,7 +68,13 @@ where
         if bucket.max_time_ms < q.earliest || bucket.min_time_ms > q.latest {
             continue; // time-prune via db_* name
         }
-        hits += if bucket.hot { scan_bucket(&bucket.dir, q, &mut emit)? } else { indexed_bucket(&bucket.dir, q, &mut emit)? };
+        let r = if bucket.hot { scan_bucket(&bucket.dir, q, &mut emit) } else { indexed_bucket(&bucket.dir, q, &mut emit) };
+        match r {
+            Ok(n) => hits += n,
+            // Bucket was renamed/removed mid-search (hot→warm roll): skip it.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
     }
     Ok(hits)
 }
