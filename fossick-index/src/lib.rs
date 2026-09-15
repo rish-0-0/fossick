@@ -1,9 +1,12 @@
 //! fossick-index: bucket storage — raw journal, event table, manifest.
 
+pub mod bloom;
 pub mod bucket;
 pub mod codec;
 pub mod journal;
 pub mod manifest;
+pub mod tokenize;
+pub mod tsidx;
 
 use std::path::{Path, PathBuf};
 

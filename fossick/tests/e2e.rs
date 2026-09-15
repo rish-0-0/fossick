@@ -102,6 +102,54 @@ fn rollover_produces_warm_buckets_and_search_spans_them() {
     assert_eq!(search::collect(&conf.data_dir, "roll_needle", now).unwrap().len(), 550);
 }
 
+/// Differential test: the indexed (tsidx+bloom) path must return exactly what
+/// the brute-force scan oracle returns, across warm and hot buckets.
+#[test]
+fn indexed_search_matches_scan_oracle() {
+    let mut conf = test_conf("differential");
+    conf.hot_max_events = 150; // force several warm buckets
+    let input = TcpInput { port: 0, source: "s".into(), sourcetype: "app".into(), host: "h".into() };
+    let lines: Vec<String> = (0..700)
+        .map(|i| {
+            format!(
+                "2026-09-15T{:02}:{:02}:{:02}Z level={} svc=api-{} diff_needle_{} some words",
+                9 + i / 3600, i / 60 % 60, i % 60,
+                if i % 3 == 0 { "error" } else { "info" },
+                i % 4,
+                i % 11
+            )
+        })
+        .collect();
+    ingest(&conf, input, None, &lines);
+    assert!(fossick_index::list_buckets(&conf.data_dir).unwrap().iter().any(|b| !b.hot));
+
+    let now = tstamp::now_ms();
+    let queries = [
+        "diff_needle_7",
+        "diff_needle_7 level=error",
+        "error words",
+        "sourcetype=app diff_needle_0",
+        "diff_needle_3 earliest=2026-09-15T09:02:00Z latest=2026-09-15T09:05:00Z",
+        "level=info api",
+        "absent_term_xyz",
+        "sourcetype=nope",
+    ];
+    for qs in queries {
+        let q = search::parse_query(qs, now).unwrap();
+        let mut indexed = Vec::new();
+        search::run(&conf.data_dir, &q, |ev, _| indexed.push((ev.time_ms, ev.raw.clone()))).unwrap();
+        let mut oracle = Vec::new();
+        search::run_scan_only(&conf.data_dir, &q, |ev, _| oracle.push((ev.time_ms, ev.raw.clone()))).unwrap();
+        indexed.sort();
+        oracle.sort();
+        assert_eq!(indexed, oracle, "query: {qs}");
+        // Sanity: the interesting queries must actually match something.
+        if !qs.contains("absent") && !qs.contains("nope") {
+            assert!(!oracle.is_empty(), "oracle empty for: {qs}");
+        }
+    }
+}
+
 #[test]
 fn fossick_header_overrides_metadata() {
     let conf = test_conf("header");

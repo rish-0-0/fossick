@@ -7,9 +7,13 @@
 
 use crate::journal::{self, decode_event, JournalReader, JournalWriter};
 use crate::manifest::{Manifest, State};
+use crate::{bloom, tokenize, tsidx};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+
+type TermMap = HashMap<Box<[u8]>, Vec<u32>>;
 
 const TBL_MAGIC: &[u8; 4] = b"FET1";
 const SYNC_EVERY_BLOCKS: u32 = 4;
@@ -24,6 +28,21 @@ pub struct HotBucket {
     blocks_since_sync: u32,
     /// Uncompressed journal bytes appended, for rollover checks.
     pub uncomp_bytes: u64,
+    /// term → arrival-order ordinals; becomes the tsidx at finalize.
+    terms: TermMap,
+}
+
+fn push_ord(map: &mut TermMap, term: &[u8], ord: u32) {
+    match map.get_mut(term) {
+        Some(v) => {
+            if v.last() != Some(&ord) {
+                v.push(ord);
+            }
+        }
+        None => {
+            map.insert(term.to_vec().into_boxed_slice(), vec![ord]);
+        }
+    }
 }
 
 impl HotBucket {
@@ -36,7 +55,16 @@ impl HotBucket {
         tbl.write_all(&0u32.to_le_bytes())?;
         let man = Manifest::new(id, fields);
         man.write(&dir)?;
-        Ok(HotBucket { dir, man, journal, tbl, pending: Vec::new(), blocks_since_sync: 0, uncomp_bytes: 0 })
+        Ok(HotBucket {
+            dir,
+            man,
+            journal,
+            tbl,
+            pending: Vec::new(),
+            blocks_since_sync: 0,
+            uncomp_bytes: 0,
+            terms: TermMap::new(),
+        })
     }
 
     /// Append one event. `metas` are (key_id, value) pairs; key_ids come from
@@ -46,6 +74,12 @@ impl HotBucket {
         let addr = self.journal.append(time_ms, metas, raw);
         self.uncomp_bytes += (self.journal.block_len() - before) as u64;
         self.pending.push((time_ms, addr));
+        let ord = self.man.event_count as u32;
+        tokenize::tokenize(raw, |tok| push_ord(&mut self.terms, tok, ord));
+        for (id, val) in metas {
+            let name = &self.man.fields[*id as usize];
+            push_ord(&mut self.terms, &tokenize::field_term(name, val), ord);
+        }
         self.man.event_count += 1;
         self.man.min_time_ms = self.man.min_time_ms.min(time_ms);
         self.man.max_time_ms = self.man.max_time_ms.max(time_ms);
@@ -95,17 +129,50 @@ impl HotBucket {
                 || self.man.max_time_ms - self.man.min_time_ms >= l.max_span_ms)
     }
 
-    /// Hot→warm: flush, write the journal trailer, time-sort events.tbl,
-    /// mark the manifest warm, rename the dir to db_<max>_<min>_<id>.
+    /// Hot→warm: flush, write the journal trailer, then seal (time-sort
+    /// events.tbl, remap+write tsidx and bloom, warm manifest, db_* rename).
     pub fn finalize(mut self) -> io::Result<PathBuf> {
         self.flush()?;
         self.journal.finalize()?;
         drop(self.tbl);
-        sort_events_tbl(&self.dir)?;
-        self.man.state = State::Warm;
-        self.man.write(&self.dir)?;
-        rename_to_db(&self.dir, &self.man)
+        let recs = read_events_tbl(&self.dir)?; // arrival order
+        seal(&self.dir, &mut self.man, recs, std::mem::take(&mut self.terms))
     }
+}
+
+/// Common hot→warm sealing for finalize and crash recovery. `recs` is the
+/// event table in arrival order (index = journal ordinal); `terms` maps
+/// term → arrival ordinals. Sorts by time, remaps ordinals to time order,
+/// writes events.tbl + index.tsidx + bloom.bf, renames to db_*.
+fn seal(dir: &Path, man: &mut Manifest, recs: Vec<(u64, u64)>, terms: TermMap) -> io::Result<PathBuf> {
+    let n = recs.len();
+    let mut idx: Vec<u32> = (0..n as u32).collect();
+    idx.sort_by_key(|&i| recs[i as usize].0);
+    let sorted: Vec<(u64, u64)> = idx.iter().map(|&i| recs[i as usize]).collect();
+    write_events_tbl(dir, &sorted)?;
+    let mut new_of_old = vec![0u32; n];
+    for (new, &old) in idx.iter().enumerate() {
+        new_of_old[old as usize] = new as u32;
+    }
+    let mut term_vec: Vec<(Box<[u8]>, Vec<u32>)> = terms
+        .into_iter()
+        .map(|(t, ords)| {
+            let mut m: Vec<u32> = ords.into_iter().map(|o| new_of_old[o as usize]).collect();
+            m.sort_unstable();
+            m.dedup();
+            (t, m)
+        })
+        .collect();
+    tsidx::write(dir, &mut term_vec)?;
+    bloom::write(dir, term_vec.iter().map(|(t, _)| t.as_ref()), term_vec.len())?;
+    man.event_count = n as u64;
+    if let (Some(first), Some(last)) = (sorted.first(), sorted.last()) {
+        man.min_time_ms = first.0;
+        man.max_time_ms = last.0;
+    }
+    man.state = State::Warm;
+    man.write(dir)?;
+    rename_to_db(dir, man)
 }
 
 /// Read events.tbl records; when `count` in the header is 0 the bucket is
@@ -140,12 +207,6 @@ fn write_events_tbl(dir: &Path, recs: &[(u64, u64)]) -> io::Result<()> {
     f.sync_data()
 }
 
-fn sort_events_tbl(dir: &Path) -> io::Result<()> {
-    let mut recs = read_events_tbl(dir)?;
-    recs.sort_by_key(|r| r.0);
-    write_events_tbl(dir, &recs)
-}
-
 /// Rename hot_<id> → db_<max>_<min>_<id>, retrying briefly for Windows
 /// sharing violations (a searcher may hold the files open).
 fn rename_to_db(dir: &Path, man: &Manifest) -> io::Result<PathBuf> {
@@ -177,25 +238,120 @@ pub fn recover_hot_dir(dir: &Path) -> io::Result<Option<PathBuf>> {
     }
     let mut reader = JournalReader::open(dir)?;
     let mut recs: Vec<(u64, u64)> = Vec::new();
+    let mut terms = TermMap::new();
     let mut block = Vec::new();
     for i in 0..reader.blocks.len() {
         reader.read_block(i, &mut block)?;
         let mut off = 0;
         while off < block.len() {
             let (v, next) = decode_event(&block, off)?;
+            let ord = recs.len() as u32;
+            tokenize::tokenize(v.raw, |tok| push_ord(&mut terms, tok, ord));
+            for (id, val) in &v.metas {
+                if let Some(name) = man.fields.get(*id as usize) {
+                    push_ord(&mut terms, &tokenize::field_term(name, val), ord);
+                }
+            }
             recs.push((v.time_ms, ((i as u64) << 32) | off as u64));
             off = next;
         }
     }
     drop(reader);
-    recs.sort_by_key(|r| r.0);
-    write_events_tbl(dir, &recs)?;
-    man.event_count = recs.len() as u64;
-    man.min_time_ms = recs.first().unwrap().0;
-    man.max_time_ms = recs.last().unwrap().0;
-    man.state = State::Warm;
-    man.write(dir)?;
-    rename_to_db(dir, &man).map(Some)
+    seal(dir, &mut man, recs, terms).map(Some)
+}
+
+/// mmap view of events.tbl: ordinal → (time_ms, journal addr), plus the
+/// binary-searched ordinal range for a time clamp (valid once time-sorted).
+pub struct EventsTbl {
+    map: memmap2::Mmap,
+    count: usize,
+}
+
+impl EventsTbl {
+    pub fn open(dir: &Path) -> io::Result<EventsTbl> {
+        let file = File::open(dir.join("events.tbl"))?;
+        let map = unsafe { memmap2::Mmap::map(&file)? };
+        if map.len() < 8 || &map[0..4] != TBL_MAGIC {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "bad events.tbl header"));
+        }
+        let count = u32::from_le_bytes(map[4..8].try_into().unwrap()) as usize;
+        let count = if count == 0 { (map.len() - 8) / 16 } else { count };
+        Ok(EventsTbl { map, count })
+    }
+
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// (time_ms, journal_addr) at ordinal `i`.
+    pub fn get(&self, i: usize) -> (u64, u64) {
+        let o = 8 + i * 16;
+        (
+            u64::from_le_bytes(self.map[o..o + 8].try_into().unwrap()),
+            u64::from_le_bytes(self.map[o + 8..o + 16].try_into().unwrap()),
+        )
+    }
+
+    /// Half-open ordinal range [lo, hi) whose times fall in [min_ms, max_ms].
+    pub fn ord_range(&self, min_ms: u64, max_ms: u64) -> (usize, usize) {
+        let lower = |target: u64| {
+            let (mut lo, mut hi) = (0, self.count);
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                if self.get(mid).0 < target {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            lo
+        };
+        (lower(min_ms), lower(max_ms.saturating_add(1)))
+    }
+}
+
+/// Small LRU of decompressed journal blocks for postings-driven reads.
+/// Bounds read memory to MAX_SLOTS × 256 KiB per open bucket.
+pub struct BlockCache {
+    reader: JournalReader,
+    slots: Vec<(u32, Vec<u8>)>,
+}
+
+const MAX_SLOTS: usize = 4;
+
+impl BlockCache {
+    pub fn open(dir: &Path) -> io::Result<BlockCache> {
+        Ok(BlockCache { reader: JournalReader::open(dir)?, slots: Vec::new() })
+    }
+
+    /// Decode the event at a journal address.
+    pub fn event(&mut self, addr: u64) -> io::Result<OwnedEvent> {
+        let blk = (addr >> 32) as u32;
+        let off = (addr & 0xffff_ffff) as usize;
+        let idx = match self.slots.iter().position(|(b, _)| *b == blk) {
+            Some(i) => i,
+            None => {
+                let mut buf = if self.slots.len() >= MAX_SLOTS { self.slots.pop().unwrap().1 } else { Vec::new() };
+                self.reader.read_block(blk as usize, &mut buf)?;
+                self.slots.insert(0, (blk, buf));
+                0
+            }
+        };
+        if idx != 0 {
+            let s = self.slots.remove(idx);
+            self.slots.insert(0, s);
+        }
+        let (v, _) = decode_event(&self.slots[0].1, off)?;
+        Ok(OwnedEvent {
+            time_ms: v.time_ms,
+            metas: v.metas.iter().map(|(id, val)| (*id, val.to_vec())).collect(),
+            raw: v.raw.to_vec(),
+        })
+    }
 }
 
 /// An event copied out of a block buffer (owned, block buffer can be reused).
@@ -384,6 +540,43 @@ mod tests {
         assert_eq!(read_events_tbl(&warm).unwrap().len(), 2500);
         let n = BucketScan::open(&warm, 0, u64::MAX, false).unwrap().map(|r| r.unwrap()).count();
         assert_eq!(n, 2500);
+    }
+
+    #[test]
+    fn finalize_builds_tsidx_and_bloom() {
+        let data = tmp();
+        let mut b = HotBucket::create(&data, 7, fields()).unwrap();
+        let st = b.man.field_id("sourcetype").unwrap();
+        // Reverse arrival order so ordinal remapping is actually exercised.
+        for i in (0u64..500).rev() {
+            b.add_event(1000 + i, &[(st, b"App")], format!("msg Alpha_{i} done").as_bytes()).unwrap();
+        }
+        let dir = b.finalize().unwrap();
+
+        let idx = crate::tsidx::Tsidx::open(&dir).unwrap();
+        // Token lookup: postings must be time-ordered ordinals.
+        let ords: Vec<u32> = idx.lookup(b"alpha_42").unwrap().collect();
+        assert_eq!(ords, vec![42]); // time 1042 → 43rd-smallest time → ordinal 42
+        assert_eq!(idx.lookup(b"done").unwrap().count(), 500);
+        assert!(idx.lookup(b"Alpha_42").is_none()); // terms are lowercased
+        // Composite field term (value lowercased).
+        assert_eq!(idx.lookup(b"sourcetype::app").unwrap().count(), 500);
+
+        let bloom = crate::bloom::Bloom::open(&dir).unwrap().unwrap();
+        assert!(bloom.may_contain(b"alpha_42"));
+        assert!(bloom.may_contain(b"sourcetype::app"));
+
+        // events.tbl ordinal → journal addr agrees with tsidx ordinals.
+        let tbl = EventsTbl::open(&dir).unwrap();
+        assert_eq!(tbl.len(), 500);
+        let (t, addr) = tbl.get(42);
+        assert_eq!(t, 1042);
+        let mut cache = BlockCache::open(&dir).unwrap();
+        let ev = cache.event(addr).unwrap();
+        assert_eq!(String::from_utf8_lossy(&ev.raw), "msg Alpha_42 done");
+        // Time clamp range.
+        assert_eq!(tbl.ord_range(1100, 1199), (100, 200));
+        assert_eq!(tbl.ord_range(0, u64::MAX), (0, 500));
     }
 
     #[test]

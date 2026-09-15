@@ -7,6 +7,7 @@
 use crate::tstamp;
 use fossick_index::bucket::{BucketScan, OwnedEvent};
 use fossick_index::list_buckets;
+use fossick_index::manifest::Manifest;
 use std::io;
 use std::path::Path;
 
@@ -57,7 +58,104 @@ fn matches(q: &Query, ev: &OwnedEvent, field_ids: &[Option<u8>]) -> bool {
 }
 
 /// Stream matching events, newest bucket first, to `emit(event, field_names)`.
+/// Hot buckets are scanned; warm buckets go through bloom → tsidx postings.
 pub fn run<F>(data_dir: &Path, q: &Query, mut emit: F) -> io::Result<u64>
+where
+    F: FnMut(&OwnedEvent, &[String]),
+{
+    let mut hits = 0;
+    for bucket in list_buckets(data_dir)? {
+        if bucket.max_time_ms < q.earliest || bucket.min_time_ms > q.latest {
+            continue; // time-prune via db_* name
+        }
+        hits += if bucket.hot { scan_bucket(&bucket.dir, q, &mut emit)? } else { indexed_bucket(&bucket.dir, q, &mut emit)? };
+    }
+    Ok(hits)
+}
+
+/// Brute-force block scan — the hot-bucket path and the differential-test oracle.
+fn scan_bucket<F>(dir: &Path, q: &Query, emit: &mut F) -> io::Result<u64>
+where
+    F: FnMut(&OwnedEvent, &[String]),
+{
+    let scan = BucketScan::open(dir, q.earliest, q.latest, true)?;
+    let field_ids: Vec<Option<u8>> = q.fields.iter().map(|(f, _)| scan.man.field_id(f)).collect();
+    let fields = scan.man.fields.clone();
+    let mut hits = 0;
+    for ev in scan {
+        let ev = ev?;
+        if matches(q, &ev, &field_ids) {
+            hits += 1;
+            emit(&ev, &fields);
+        }
+    }
+    Ok(hits)
+}
+
+/// Warm-bucket path: bloom prune → postings intersection → time clamp via
+/// events.tbl → block-cache decode (newest first) → verify → emit.
+fn indexed_bucket<F>(dir: &Path, q: &Query, emit: &mut F) -> io::Result<u64>
+where
+    F: FnMut(&OwnedEvent, &[String]),
+{
+    use fossick_index::{bloom::Bloom, bucket::{BlockCache, EventsTbl}, tokenize, tsidx::{self, Tsidx}};
+
+    let idx = match Tsidx::open(dir) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return scan_bucket(dir, q, emit), // pre-tsidx bucket
+        Err(e) => return Err(e),
+    };
+    // Required index terms: every token of every AND term + field composites.
+    let mut req: Vec<Vec<u8>> = Vec::new();
+    for t in &q.terms {
+        tokenize::tokenize(t.as_bytes(), |tok| req.push(tok.to_vec()));
+    }
+    for (f, v) in &q.fields {
+        req.push(tokenize::field_term(f, v.as_bytes()));
+    }
+    req.sort();
+    req.dedup();
+    if req.is_empty() {
+        return scan_bucket(dir, q, emit); // pure time-range search
+    }
+    if let Some(bloom) = Bloom::open(dir)? {
+        if req.iter().any(|t| !bloom.may_contain(t)) {
+            return Ok(0); // bucket cannot contain all required terms
+        }
+    }
+    let mut posts = Vec::with_capacity(req.len());
+    for t in &req {
+        match idx.lookup(t) {
+            Some(p) => posts.push(p),
+            None => return Ok(0),
+        }
+    }
+    let ords = tsidx::intersect(posts);
+    let man = Manifest::read(dir)?;
+    let field_ids: Vec<Option<u8>> = q.fields.iter().map(|(f, _)| man.field_id(f)).collect();
+    let tbl = EventsTbl::open(dir)?;
+    let (lo, hi) = tbl.ord_range(q.earliest, q.latest);
+    let mut cache = BlockCache::open(dir)?;
+    let mut hits = 0;
+    for &ord in ords.iter().rev() {
+        // postings are time-ordered → reverse iteration = newest first
+        let ord = ord as usize;
+        if ord < lo || ord >= hi {
+            continue;
+        }
+        let (_, addr) = tbl.get(ord);
+        let ev = cache.event(addr)?;
+        if matches(q, &ev, &field_ids) {
+            hits += 1;
+            emit(&ev, &man.fields);
+        }
+    }
+    Ok(hits)
+}
+
+/// Differential-test oracle: brute-force scan of every bucket, ignoring
+/// tsidx/bloom entirely.
+pub fn run_scan_only<F>(data_dir: &Path, q: &Query, mut emit: F) -> io::Result<u64>
 where
     F: FnMut(&OwnedEvent, &[String]),
 {
@@ -66,16 +164,7 @@ where
         if bucket.max_time_ms < q.earliest || bucket.min_time_ms > q.latest {
             continue;
         }
-        let scan = BucketScan::open(&bucket.dir, q.earliest, q.latest, true)?;
-        let field_ids: Vec<Option<u8>> = q.fields.iter().map(|(f, _)| scan.man.field_id(f)).collect();
-        let fields = scan.man.fields.clone();
-        for ev in scan {
-            let ev = ev?;
-            if matches(q, &ev, &field_ids) {
-                hits += 1;
-                emit(&ev, &fields);
-            }
-        }
+        hits += scan_bucket(&bucket.dir, q, &mut emit)?;
     }
     Ok(hits)
 }
