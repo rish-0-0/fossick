@@ -5,7 +5,7 @@
 //! so readers can address blocks before the trailer exists. An event address packs
 //! `(block_no << 32) | offset_in_block`.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
