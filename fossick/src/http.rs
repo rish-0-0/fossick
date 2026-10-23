@@ -1,31 +1,42 @@
-//! Hand-rolled HTTP/1.1 search API (no framework, std::net only).
-//! Binds 127.0.0.1 only. Responses are close-delimited so results stream
-//! event-at-a-time with bounded memory.
+//! Hand-rolled HTTP/1.1 search head (no framework, std::net only).
+//! Binds 127.0.0.1 only.
 //!
-//! GET /health            → 200 "ok"
-//! GET /search?q=<query>  → 200 application/x-ndjson, one JSON event per line
+//! GET /                     → embedded web UI
+//! GET /health               → 200 "ok"
+//! GET /search?q=<query>     → application/x-ndjson event stream (legacy scan query)
+//! GET /api/search?q=<spl>[&earliest=..&latest=..] → JSON result table
+//!
+//! All search traffic goes through this head, never the index directly; the
+//! head resolves/rewrites time bounds and applies result limits (see spl.rs).
 
-use crate::{search, tstamp};
+use crate::conf::Conf;
+use crate::{search, spl, tstamp};
 use fossick_index::bucket::OwnedEvent;
+use fossick_spl::Value;
 use std::io::{self, BufWriter, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 const MAX_REQUEST: usize = 16 * 1024;
 
+// Web UI bundle, staged by build.rs from ui/dist (placeholder when unbuilt).
+const UI_INDEX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ui/index.html"));
+const UI_JS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ui/assets/app.js"));
+const UI_CSS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ui/assets/app.css"));
+
 /// Accept-loop in a background thread; one thread per request (laptop scale).
-pub fn spawn(listener: TcpListener, data_dir: PathBuf) {
+pub fn spawn(listener: TcpListener, conf: Conf) {
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
-            let d = data_dir.clone();
+            let c = conf.clone();
             std::thread::spawn(move || {
-                let _ = handle(stream, &d);
+                let _ = handle(stream, &c);
             });
         }
     });
 }
 
-fn handle(mut stream: TcpStream, data_dir: &Path) -> io::Result<()> {
+fn handle(mut stream: TcpStream, conf: &Conf) -> io::Result<()> {
     // Read request head (we ignore any body — GET only).
     let mut head = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -47,15 +58,40 @@ fn handle(mut stream: TcpStream, data_dir: &Path) -> io::Result<()> {
         return respond(&mut stream, 405, "only GET is supported\n");
     }
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    let param = |name: &str| {
+        query
+            .split('&')
+            .filter_map(|kv| kv.split_once('='))
+            .find(|(k, _)| *k == name)
+            .map(|(_, v)| pct_decode(v))
+    };
     match path {
         "/health" => respond(&mut stream, 200, "ok\n"),
+        "/" | "/index.html" => respond_bytes(&mut stream, "text/html; charset=utf-8", UI_INDEX),
+        "/assets/app.js" => respond_bytes(&mut stream, "application/javascript", UI_JS),
+        "/assets/app.css" => respond_bytes(&mut stream, "text/css", UI_CSS),
+        "/favicon.ico" => respond_bytes(&mut stream, "image/x-icon", &[]), // silence browser noise
+        "/api/search" => {
+            let q = param("q").unwrap_or_default();
+            let (earliest, latest) = (param("earliest"), param("latest"));
+            let req = spl::SplRequest { spl: &q, earliest: earliest.as_deref(), latest: latest.as_deref() };
+            let started = Instant::now();
+            match spl::run(&conf.data_dir, conf, &req, tstamp::now_ms()) {
+                Ok(res) => {
+                    let body = result_json(&res, started.elapsed().as_millis() as u64);
+                    respond_bytes(&mut stream, "application/json", body.as_bytes())
+                }
+                Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
+                    let mut body = String::from("{\"error\":\"");
+                    json_escape(&mut body, &e.to_string());
+                    body.push_str("\"}");
+                    respond_with(&mut stream, 400, "application/json", body.as_bytes())
+                }
+                Err(e) => respond(&mut stream, 500, &format!("search failed: {e}\n")),
+            }
+        }
         "/search" => {
-            let q = query
-                .split('&')
-                .filter_map(|kv| kv.split_once('='))
-                .find(|(k, _)| *k == "q")
-                .map(|(_, v)| pct_decode(v))
-                .unwrap_or_default();
+            let q = param("q").unwrap_or_default();
             let parsed = match search::parse_query(&q, tstamp::now_ms()) {
                 Ok(p) => p,
                 Err(e) => return respond(&mut stream, 400, &format!("bad query: {e}\n")),
@@ -65,16 +101,75 @@ fn handle(mut stream: TcpStream, data_dir: &Path) -> io::Result<()> {
                 b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n",
             )?;
             let mut line = String::new();
-            search::run(data_dir, &parsed, |ev, fields| {
+            search::run(&conf.data_dir, &parsed, |ev, fields| {
                 line.clear();
                 event_json(&mut line, ev, fields);
                 line.push('\n');
-                let _ = w.write_all(line.as_bytes());
+                w.write_all(line.as_bytes()).is_ok()
             })?;
             w.flush()
         }
         _ => respond(&mut stream, 404, "not found\n"),
     }
+}
+
+/// `/api/search` response: {"fields":[..],"rows":[[..]],"isAggregated":..,
+/// "truncated":..,"matched":n,"tookMs":n}. Numbers stay JSON numbers so the
+/// UI can sort typed columns correctly.
+pub fn result_json(res: &spl::SplResult, took_ms: u64) -> String {
+    let t = &res.table;
+    let mut s = String::with_capacity(256 + t.rows.len() * 64);
+    s.push_str("{\"fields\":[");
+    for (i, f) in t.fields.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push('"');
+        json_escape(&mut s, f);
+        s.push('"');
+    }
+    s.push_str("],\"rows\":[");
+    for (i, row) in t.rows.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push('[');
+        for (j, v) in row.iter().enumerate() {
+            if j > 0 {
+                s.push(',');
+            }
+            match v {
+                Value::Null => s.push_str("null"),
+                Value::Bool(b) => s.push_str(if *b { "true" } else { "false" }),
+                Value::Num(n) if n.is_finite() => s.push_str(&fossick_spl::fmt_num(*n)),
+                v => {
+                    s.push('"');
+                    json_escape(&mut s, &v.render().unwrap_or_default());
+                    s.push('"');
+                }
+            }
+        }
+        s.push(']');
+    }
+    s.push_str(&format!(
+        "],\"isAggregated\":{},\"truncated\":{},\"matched\":{},\"tookMs\":{took_ms}}}",
+        t.is_aggregated, t.truncated, res.matched
+    ));
+    s
+}
+
+fn respond_bytes(stream: &mut TcpStream, ctype: &str, body: &[u8]) -> io::Result<()> {
+    respond_with(stream, 200, ctype, body)
+}
+
+fn respond_with(stream: &mut TcpStream, code: u16, ctype: &str, body: &[u8]) -> io::Result<()> {
+    let reason = if code == 200 { "OK" } else { "Bad Request" };
+    write!(
+        stream,
+        "HTTP/1.1 {code} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )?;
+    stream.write_all(body)
 }
 
 fn respond(stream: &mut TcpStream, code: u16, body: &str) -> io::Result<()> {

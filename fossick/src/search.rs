@@ -42,8 +42,10 @@ pub fn parse_query(q: &str, now_ms: u64) -> io::Result<Query> {
 
 fn matches(q: &Query, ev: &OwnedEvent, field_ids: &[Option<u8>]) -> bool {
     for (i, (_, want)) in q.fields.iter().enumerate() {
+        // Case-insensitive value match, consistent with the lowercased
+        // `name::value` terms the tsidx/bloom pushdown uses.
         let hit = match field_ids[i] {
-            Some(id) => ev.metas.iter().any(|(k, v)| *k == id && v == want.as_bytes()),
+            Some(id) => ev.metas.iter().any(|(k, v)| *k == id && v.eq_ignore_ascii_case(want.as_bytes())),
             None => false, // field not in this bucket's table
         };
         if !hit {
@@ -60,9 +62,10 @@ fn contains_ci(hay: &[u8], needle: &[u8]) -> bool {
 
 /// Stream matching events, newest bucket first, to `emit(event, field_names)`.
 /// Hot buckets are scanned; warm buckets go through bloom → tsidx postings.
+/// `emit` returning false stops the search early (e.g. `| head N` satisfied).
 pub fn run<F>(data_dir: &Path, q: &Query, mut emit: F) -> io::Result<u64>
 where
-    F: FnMut(&OwnedEvent, &[String]),
+    F: FnMut(&OwnedEvent, &[String]) -> bool,
 {
     let mut hits = 0;
     for bucket in list_buckets(data_dir)? {
@@ -71,7 +74,12 @@ where
         }
         let r = if bucket.hot { scan_bucket(&bucket.dir, q, &mut emit) } else { indexed_bucket(&bucket.dir, q, &mut emit) };
         match r {
-            Ok(n) => hits += n,
+            Ok((n, more)) => {
+                hits += n;
+                if !more {
+                    break;
+                }
+            }
             // Bucket was renamed/removed mid-search (hot→warm roll): skip it.
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
@@ -81,9 +89,9 @@ where
 }
 
 /// Brute-force block scan — the hot-bucket path and the differential-test oracle.
-fn scan_bucket<F>(dir: &Path, q: &Query, emit: &mut F) -> io::Result<u64>
+fn scan_bucket<F>(dir: &Path, q: &Query, emit: &mut F) -> io::Result<(u64, bool)>
 where
-    F: FnMut(&OwnedEvent, &[String]),
+    F: FnMut(&OwnedEvent, &[String]) -> bool,
 {
     let scan = BucketScan::open(dir, q.earliest, q.latest, true)?;
     let field_ids: Vec<Option<u8>> = q.fields.iter().map(|(f, _)| scan.man.field_id(f)).collect();
@@ -93,17 +101,19 @@ where
         let ev = ev?;
         if matches(q, &ev, &field_ids) {
             hits += 1;
-            emit(&ev, &fields);
+            if !emit(&ev, &fields) {
+                return Ok((hits, false));
+            }
         }
     }
-    Ok(hits)
+    Ok((hits, true))
 }
 
 /// Warm-bucket path: bloom prune → postings intersection → time clamp via
 /// events.tbl → block-cache decode (newest first) → verify → emit.
-fn indexed_bucket<F>(dir: &Path, q: &Query, emit: &mut F) -> io::Result<u64>
+fn indexed_bucket<F>(dir: &Path, q: &Query, emit: &mut F) -> io::Result<(u64, bool)>
 where
-    F: FnMut(&OwnedEvent, &[String]),
+    F: FnMut(&OwnedEvent, &[String]) -> bool,
 {
     use fossick_index::{bloom::Bloom, bucket::{BlockCache, EventsTbl}, tokenize, tsidx::{self, Tsidx}};
 
@@ -127,14 +137,14 @@ where
     }
     if let Some(bloom) = Bloom::open(dir)? {
         if req.iter().any(|t| !bloom.may_contain(t)) {
-            return Ok(0); // bucket cannot contain all required terms
+            return Ok((0, true)); // bucket cannot contain all required terms
         }
     }
     let mut posts = Vec::with_capacity(req.len());
     for t in &req {
         match idx.lookup(t) {
             Some(p) => posts.push(p),
-            None => return Ok(0),
+            None => return Ok((0, true)),
         }
     }
     let ords = tsidx::intersect(posts);
@@ -154,24 +164,30 @@ where
         let ev = cache.event(addr)?;
         if matches(q, &ev, &field_ids) {
             hits += 1;
-            emit(&ev, &man.fields);
+            if !emit(&ev, &man.fields) {
+                return Ok((hits, false));
+            }
         }
     }
-    Ok(hits)
+    Ok((hits, true))
 }
 
 /// Differential-test oracle: brute-force scan of every bucket, ignoring
 /// tsidx/bloom entirely.
 pub fn run_scan_only<F>(data_dir: &Path, q: &Query, mut emit: F) -> io::Result<u64>
 where
-    F: FnMut(&OwnedEvent, &[String]),
+    F: FnMut(&OwnedEvent, &[String]) -> bool,
 {
     let mut hits = 0;
     for bucket in list_buckets(data_dir)? {
         if bucket.max_time_ms < q.earliest || bucket.min_time_ms > q.latest {
             continue;
         }
-        hits += scan_bucket(&bucket.dir, q, &mut emit)?;
+        let (n, more) = scan_bucket(&bucket.dir, q, &mut emit)?;
+        hits += n;
+        if !more {
+            break;
+        }
     }
     Ok(hits)
 }
@@ -180,7 +196,10 @@ where
 pub fn collect(data_dir: &Path, query: &str, now_ms: u64) -> io::Result<Vec<(u64, String)>> {
     let q = parse_query(query, now_ms)?;
     let mut out = Vec::new();
-    run(data_dir, &q, |ev, _| out.push((ev.time_ms, String::from_utf8_lossy(&ev.raw).into_owned())))?;
+    run(data_dir, &q, |ev, _| {
+        out.push((ev.time_ms, String::from_utf8_lossy(&ev.raw).into_owned()));
+        true
+    })?;
     Ok(out)
 }
 

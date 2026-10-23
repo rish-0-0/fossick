@@ -137,9 +137,17 @@ fn indexed_search_matches_scan_oracle() {
     for qs in queries {
         let q = search::parse_query(qs, now).unwrap();
         let mut indexed = Vec::new();
-        search::run(&conf.data_dir, &q, |ev, _| indexed.push((ev.time_ms, ev.raw.clone()))).unwrap();
+        search::run(&conf.data_dir, &q, |ev, _| {
+            indexed.push((ev.time_ms, ev.raw.clone()));
+            true
+        })
+        .unwrap();
         let mut oracle = Vec::new();
-        search::run_scan_only(&conf.data_dir, &q, |ev, _| oracle.push((ev.time_ms, ev.raw.clone()))).unwrap();
+        search::run_scan_only(&conf.data_dir, &q, |ev, _| {
+            oracle.push((ev.time_ms, ev.raw.clone()));
+            true
+        })
+        .unwrap();
         indexed.sort();
         oracle.sort();
         assert_eq!(indexed, oracle, "query: {qs}");
@@ -189,7 +197,7 @@ fn rest_api_streams_ndjson_results() {
 
     let api = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = api.local_addr().unwrap().port();
-    fossick::http::spawn(api, conf.data_dir.clone());
+    fossick::http::spawn(api, conf.clone());
 
     let get = |target: &str| -> (String, String) {
         let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -245,4 +253,50 @@ fn crlf_blank_lines_and_no_trailing_newline() {
     let raws: Vec<&str> = hits.iter().map(|(_, r)| r.as_str()).collect();
     assert_eq!(hits.len(), 2);
     assert!(raws.contains(&"first line") && raws.contains(&"second line"));
+}
+
+#[test]
+fn spl_api_returns_json_tables() {
+    use std::io::Read;
+    let conf = test_conf("spl-api");
+    let input = TcpInput { port: 0, source: "s".into(), sourcetype: "app".into(), host: "web01".into() };
+    let lines: Vec<String> = (0..30)
+        .map(|i| format!("2026-09-15T10:00:{:02}Z level={} req dur={}", i % 60, if i % 5 == 0 { "error" } else { "info" }, i))
+        .collect();
+    ingest(&conf, input, None, &lines);
+
+    let api = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = api.local_addr().unwrap().port();
+    fossick::http::spawn(api, conf.clone());
+    let get = |target: &str| -> (String, String) {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        write!(s, "GET {target} HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        let mut resp = String::new();
+        s.read_to_string(&mut resp).unwrap();
+        let (head, body) = resp.split_once("\r\n\r\n").unwrap();
+        (head.to_string(), body.to_string())
+    };
+
+    // Aggregating pipeline: stats by the index-time `level` field.
+    let (head, body) = get("/api/search?q=req%20%7C%20stats%20count%20by%20level");
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(head.contains("application/json"));
+    assert!(body.contains("\"fields\":[\"level\",\"count\"]"), "{body}");
+    assert!(body.contains("[\"error\",6]") && body.contains("[\"info\",24]"), "{body}");
+    assert!(body.contains("\"isAggregated\":true") && body.contains("\"matched\":30"), "{body}");
+
+    // Event search with search-time kv extraction + eval.
+    let (_, body) = get("/api/search?q=level%3Derror%20%7C%20eval%20d2%3Ddur*2%20%7C%20sort%20-d2%20%7C%20head%201%20%7C%20table%20dur%20d2");
+    assert!(body.contains("\"fields\":[\"dur\",\"d2\"]"), "{body}");
+    assert!(body.contains("[\"25\",50]"), "{body}");
+
+    // Bad SPL → 400 with a JSON error.
+    let (head, body) = get("/api/search?q=%7C%20nosuchcmd");
+    assert!(head.starts_with("HTTP/1.1 400"), "{head}");
+    assert!(body.contains("\"error\""), "{body}");
+
+    // UI shell is served at /.
+    let (head, body) = get("/");
+    assert!(head.starts_with("HTTP/1.1 200") && head.contains("text/html"), "{head}");
+    assert!(body.contains("fossick"), "{body}");
 }

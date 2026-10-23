@@ -1,12 +1,13 @@
-use fossick::{conf::Conf, loggen, search, serve, tstamp};
+use fossick::{conf::Conf, loggen, serve, spl, tstamp};
 use std::process::exit;
 
 const USAGE: &str = "usage:
   fossick serve  [--conf <path>]
-  fossick search \"<query>\" [--conf <path>]
+  fossick search \"<spl>\" [--conf <path>]
   fossick loggen --port <p> --count <n>
 
-query: bare terms (substring match), field=value, earliest=/latest= (-15m, now, ISO, epoch)
+spl: terms, field=value, earliest=/latest=, then pipes:
+  where eval stats sort head tail reverse dedup table fields rename rex regex top rare fillnull
 conf resolution: --conf, else $FOSSICK_CONF, else ./fossick.conf, else built-in defaults";
 
 fn load_conf(explicit: Option<String>) -> Conf {
@@ -64,17 +65,23 @@ fn main() {
         "serve" => serve::run(conf),
         "search" => {
             let qstr = positional.first().map(String::as_str).unwrap_or("");
-            let q = match search::parse_query(qstr, tstamp::now_ms()) {
-                Ok(q) => q,
-                Err(e) => {
+            let req = spl::SplRequest { spl: qstr, earliest: None, latest: None };
+            match spl::run(&conf.data_dir, &conf, &req, tstamp::now_ms()) {
+                Ok(res) => {
+                    println!("{}", res.table.fields.join("\t"));
+                    for row in &res.table.rows {
+                        let cells: Vec<String> = row.iter().map(fossick_spl::render_cell).collect();
+                        println!("{}", cells.join("\t"));
+                    }
+                    eprintln!("{} rows ({} events matched)", res.table.rows.len(), res.matched);
+                    Ok(())
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
                     eprintln!("fossick: {e}");
                     exit(2);
                 }
-            };
-            search::run(&conf.data_dir, &q, |ev, _| {
-                println!("{}  {}", tstamp::to_iso(ev.time_ms), String::from_utf8_lossy(&ev.raw));
-            })
-            .map(|hits| eprintln!("{hits} events"))
+                Err(e) => Err(e),
+            }
         }
         "loggen" => {
             if port == 0 || count == 0 {

@@ -34,8 +34,8 @@ pub fn base_fields(conf: &Conf) -> Vec<String> {
 pub fn run(conf: Conf) -> io::Result<()> {
     if conf.api_port != 0 {
         let api = TcpListener::bind(("127.0.0.1", conf.api_port))?;
-        eprintln!("fossick: search API on http://127.0.0.1:{}/search?q=...", conf.api_port);
-        crate::http::spawn(api, conf.data_dir.clone());
+        eprintln!("fossick: web UI + search API on http://127.0.0.1:{}/", conf.api_port);
+        crate::http::spawn(api, conf.clone());
     }
     let (tx, rx) = std::sync::mpsc::channel();
     for input in conf.inputs.clone() {

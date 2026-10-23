@@ -19,6 +19,8 @@ pub struct Conf {
     pub sort_max: usize,
     pub stats_max_groups: usize,
     pub dedup_max: usize,
+    /// Cap on events returned by a non-aggregated search.
+    pub max_results: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -50,6 +52,7 @@ impl Default for Conf {
             sort_max: 10_000,
             stats_max_groups: 100_000,
             dedup_max: 100_000,
+            max_results: 10_000,
         }
     }
 }
@@ -98,6 +101,7 @@ impl Conf {
                 ("limits", "sort_max") => c.sort_max = num(v)? as usize,
                 ("limits", "stats_max_groups") => c.stats_max_groups = num(v)? as usize,
                 ("limits", "dedup_max") => c.dedup_max = num(v)? as usize,
+                ("limits", "max_results") => c.max_results = num(v)? as usize,
                 ("indexed_fields", name) => {
                     if v != "kv" {
                         return Err(bad(n, format!("indexed field {name}: only 'kv' extraction is supported, got {v}")));

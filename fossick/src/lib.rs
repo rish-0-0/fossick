@@ -5,4 +5,5 @@ pub mod http;
 pub mod loggen;
 pub mod search;
 pub mod serve;
+pub mod spl;
 pub mod tstamp;

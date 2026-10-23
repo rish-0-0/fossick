@@ -1,2 +1,5 @@
 /target
 *.conf.local
+ui/node_modules
+ui/dist
+ui/coverage
