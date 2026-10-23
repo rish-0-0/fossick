@@ -165,11 +165,8 @@ pub fn run_indexer(conf: &Conf, rx: Receiver<IngestEvent>) -> io::Result<()> {
     loop {
         match rx.recv_timeout(FLUSH_EVERY) {
             Ok(ev) => {
-                let mut metas: Vec<(u8, &[u8])> = vec![
-                    (0, ev.source.as_bytes()),
-                    (1, ev.sourcetype.as_bytes()),
-                    (2, ev.host.as_bytes()),
-                ];
+                let mut metas: Vec<(u8, &[u8])> =
+                    vec![(0, ev.source.as_bytes()), (1, ev.sourcetype.as_bytes()), (2, ev.host.as_bytes())];
                 for (i, name) in conf.indexed_fields.iter().enumerate() {
                     if let Some(val) = kv_extract(&ev.raw, name.as_bytes()) {
                         metas.push((3 + i as u8, val));
@@ -194,8 +191,9 @@ pub fn run_indexer(conf: &Conf, rx: Receiver<IngestEvent>) -> io::Result<()> {
 /// Find `name=value` or `name="value"` in a raw line (index-time kv fields).
 pub fn kv_extract<'a>(raw: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
     let mut from = 0;
-    while from + name.len() + 1 <= raw.len() {
-        let i = from + raw[from..].windows(name.len() + 1).position(|w| &w[..name.len()] == name && w[name.len()] == b'=')?;
+    while from + name.len() < raw.len() {
+        let i = from
+            + raw[from..].windows(name.len() + 1).position(|w| &w[..name.len()] == name && w[name.len()] == b'=')?;
         let boundary_ok = i == 0 || !(raw[i - 1].is_ascii_alphanumeric() || raw[i - 1] == b'_');
         if !boundary_ok {
             from = i + 1;

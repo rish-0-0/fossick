@@ -57,9 +57,8 @@ thread_local! {
 fn cached_regex<T>(pat: &str, f: impl FnOnce(&regex::Regex) -> T) -> Result<T, String> {
     RE_CACHE.with(|c| {
         let mut c = c.borrow_mut();
-        let entry = c
-            .entry(pat.to_string())
-            .or_insert_with(|| regex::Regex::new(pat).map_err(|e| format!("bad regex: {e}")));
+        let entry =
+            c.entry(pat.to_string()).or_insert_with(|| regex::Regex::new(pat).map_err(|e| format!("bad regex: {e}")));
         match entry {
             Ok(re) => Ok(f(re)),
             Err(e) => Err(e.clone()),
@@ -234,12 +233,8 @@ fn call(name: &str, args: &[Expr], rec: &Record, ctx: &Ctx) -> Result<Value, Str
             let text: Vec<char> = s(0).chars().collect();
             let start = num(1).unwrap_or(1.0) as i64;
             // 1-based; negative counts from the end (Splunk semantics).
-            let from = if start > 0 {
-                (start - 1) as usize
-            } else {
-                text.len().saturating_sub((-start) as usize)
-            }
-            .min(text.len());
+            let from = if start > 0 { (start - 1) as usize } else { text.len().saturating_sub((-start) as usize) }
+                .min(text.len());
             let n = v.get(2).and_then(Value::as_num).map(|n| n.max(0.0) as usize).unwrap_or(usize::MAX);
             Value::Str(text[from..].iter().take(n).collect())
         }
@@ -248,13 +243,13 @@ fn call(name: &str, args: &[Expr], rec: &Record, ctx: &Ctx) -> Result<Value, Str
             cached_regex(&s(1), |re| Value::Str(re.replace_all(&text, rep.as_str()).into_owned()))?
         }
         "tonumber" => match v.get(1).and_then(Value::as_num) {
-            Some(base) => {
-                num_fn(i64::from_str_radix(s(0).trim(), base as u32).ok().map(|n| n as f64))
-            }
+            Some(base) => num_fn(i64::from_str_radix(s(0).trim(), base as u32).ok().map(|n| n as f64)),
             None => num_fn(num(0)),
         },
         "tostring" => match v.get(1).and_then(Value::render).as_deref() {
-            Some("hex") => num_fn(num(0)).as_num().map(|n| Value::Str(format!("0x{:x}", n as i64))).unwrap_or(Value::Null),
+            Some("hex") => {
+                num_fn(num(0)).as_num().map(|n| Value::Str(format!("0x{:x}", n as i64))).unwrap_or(Value::Null)
+            }
             Some("commas") => match num(0) {
                 Some(n) => Value::Str(group_commas(n)),
                 None => Value::Str(s(0)),
@@ -357,7 +352,8 @@ mod tests {
         let lt = Expr::Cmp(CmpOp::Lt, Box::new(Expr::Field("n".into())), Box::new(Expr::Field("m".into())));
         assert_eq!(ev(&lt, &r), Value::Bool(true));
         // Null never compares true.
-        let vs_null = Expr::Cmp(CmpOp::Ne, Box::new(Expr::Field("missing".into())), Box::new(Expr::Lit(Value::Num(1.0))));
+        let vs_null =
+            Expr::Cmp(CmpOp::Ne, Box::new(Expr::Field("missing".into())), Box::new(Expr::Lit(Value::Num(1.0))));
         assert_eq!(ev(&vs_null, &r), Value::Bool(false));
     }
 
@@ -366,7 +362,8 @@ mod tests {
         let r = rec(&[("a", Value::Num(7.0)), ("b", Value::str("3"))]);
         let div = Expr::Arith(ArithOp::Div, Box::new(Expr::Field("a".into())), Box::new(Expr::Field("b".into())));
         assert_eq!(ev(&div, &r), Value::Num(7.0 / 3.0));
-        let by_zero = Expr::Arith(ArithOp::Div, Box::new(Expr::Field("a".into())), Box::new(Expr::Lit(Value::Num(0.0))));
+        let by_zero =
+            Expr::Arith(ArithOp::Div, Box::new(Expr::Field("a".into())), Box::new(Expr::Lit(Value::Num(0.0))));
         assert_eq!(ev(&by_zero, &r), Value::Null);
         let cat = Expr::Arith(ArithOp::Concat, Box::new(Expr::Field("a".into())), Box::new(Expr::Lit(Value::str("x"))));
         assert_eq!(ev(&cat, &r), Value::str("7x"));
@@ -410,7 +407,13 @@ mod tests {
         assert_eq!(f("tostring", vec![lit(Value::Num(3661.0)), lit(Value::str("duration"))]), Value::str("01:01:01"));
         assert_eq!(f("in", vec![fld("x"), lit(Value::str("hi")), lit(Value::str("hello"))]), Value::Bool(true));
         assert_eq!(f("min", vec![lit(Value::str("9")), lit(Value::str("10"))]), Value::str("9"));
-        assert_eq!(f("case", vec![lit(Value::Bool(false)), lit(Value::str("a")), lit(Value::Bool(true)), lit(Value::str("b"))]), Value::str("b"));
+        assert_eq!(
+            f(
+                "case",
+                vec![lit(Value::Bool(false)), lit(Value::str("a")), lit(Value::Bool(true)), lit(Value::str("b"))]
+            ),
+            Value::str("b")
+        );
         assert_eq!(f("now", vec![]), Value::Num(1_789_473_600.0));
         assert_eq!(f("typeof", vec![fld("n")]), Value::str("Number"));
     }

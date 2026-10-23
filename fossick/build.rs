@@ -16,11 +16,7 @@ fn main() {
     let dist = Path::new("../ui/dist");
     println!("cargo:rerun-if-changed=../ui/dist");
     fs::create_dir_all(format!("{out}/ui/assets")).unwrap();
-    for (name, placeholder) in [
-        ("index.html", PLACEHOLDER),
-        ("assets/app.js", ""),
-        ("assets/app.css", ""),
-    ] {
+    for (name, placeholder) in [("index.html", PLACEHOLDER), ("assets/app.js", ""), ("assets/app.css", "")] {
         let src = dist.join(name);
         let dst = format!("{out}/ui/{name}");
         if src.exists() {

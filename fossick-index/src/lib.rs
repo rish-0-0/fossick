@@ -42,6 +42,6 @@ pub fn list_buckets(data_dir: &Path) -> std::io::Result<Vec<BucketRef>> {
             }
         }
     }
-    out.sort_by(|a, b| (b.hot, b.max_time_ms, b.id).cmp(&(a.hot, a.max_time_ms, a.id)));
+    out.sort_by_key(|a| std::cmp::Reverse((a.hot, a.max_time_ms, a.id)));
     Ok(out)
 }

@@ -69,7 +69,12 @@ fn ingest_and_search_roundtrip() {
     assert_eq!(hits.len(), 500 / 7 + 1);
 
     // Time range clamps: events span 10:00:00–10:08:19 on 2026-09-15.
-    let hits = search::collect(&conf.data_dir, "step earliest=2026-09-15T10:01:00Z latest=2026-09-15T10:01:59Z", tstamp::now_ms()).unwrap();
+    let hits = search::collect(
+        &conf.data_dir,
+        "step earliest=2026-09-15T10:01:00Z latest=2026-09-15T10:01:59Z",
+        tstamp::now_ms(),
+    )
+    .unwrap();
     assert_eq!(hits.len(), 60);
 }
 
@@ -113,7 +118,9 @@ fn indexed_search_matches_scan_oracle() {
         .map(|i| {
             format!(
                 "2026-09-15T{:02}:{:02}:{:02}Z level={} svc=api-{} diff_needle_{} some words",
-                9 + i / 3600, i / 60 % 60, i % 60,
+                9 + i / 3600,
+                i / 60 % 60,
+                i % 60,
                 if i % 3 == 0 { "error" } else { "info" },
                 i % 4,
                 i % 11
@@ -169,7 +176,10 @@ fn fossick_header_overrides_metadata() {
         &["2026-09-15T10:00:00Z GET /".to_string()],
     );
     let now = tstamp::now_ms();
-    assert_eq!(search::collect(&conf.data_dir, "sourcetype=nginx host=web01 source=/var/log/nginx.log", now).unwrap().len(), 1);
+    assert_eq!(
+        search::collect(&conf.data_dir, "sourcetype=nginx host=web01 source=/var/log/nginx.log", now).unwrap().len(),
+        1
+    );
     assert!(search::collect(&conf.data_dir, "sourcetype=default", now).unwrap().is_empty());
 }
 
@@ -261,7 +271,9 @@ fn spl_api_returns_json_tables() {
     let conf = test_conf("spl-api");
     let input = TcpInput { port: 0, source: "s".into(), sourcetype: "app".into(), host: "web01".into() };
     let lines: Vec<String> = (0..30)
-        .map(|i| format!("2026-09-15T10:00:{:02}Z level={} req dur={}", i % 60, if i % 5 == 0 { "error" } else { "info" }, i))
+        .map(|i| {
+            format!("2026-09-15T10:00:{:02}Z level={} req dur={}", i % 60, if i % 5 == 0 { "error" } else { "info" }, i)
+        })
         .collect();
     ingest(&conf, input, None, &lines);
 

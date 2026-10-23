@@ -77,9 +77,7 @@ impl Manifest {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let (k, v) = line
-                .split_once('=')
-                .ok_or_else(|| bad(format!("manifest: bad line: {line}")))?;
+            let (k, v) = line.split_once('=').ok_or_else(|| bad(format!("manifest: bad line: {line}")))?;
             let (k, v) = (k.trim(), v.trim());
             let num = || v.parse::<u64>().map_err(|_| bad(format!("manifest: bad number for {k}: {v}")));
             match k {

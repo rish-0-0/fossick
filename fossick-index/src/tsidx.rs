@@ -45,7 +45,7 @@ fn get_varint(data: &[u8], pos: &mut usize) -> Option<u32> {
 
 /// Write index.tsidx. `terms` maps term → ascending, deduped event ordinals;
 /// entries are sorted in place.
-pub fn write(dir: &Path, terms: &mut Vec<(Box<[u8]>, Vec<u32>)>) -> io::Result<()> {
+pub fn write(dir: &Path, terms: &mut [(Box<[u8]>, Vec<u32>)]) -> io::Result<()> {
     terms.sort_by(|a, b| a.0.cmp(&b.0));
     let mut f = BufWriter::new(std::fs::File::create(dir.join("index.tsidx"))?);
     let mut pos: u64 = 12;
@@ -310,10 +310,11 @@ mod tests {
     #[test]
     fn prefix_scan() {
         let d = tmp();
-        let mut terms: Vec<(Box<[u8]>, Vec<u32>)> = [("apple", vec![1]), ("applet", vec![2]), ("apply", vec![3]), ("banana", vec![4])]
-            .into_iter()
-            .map(|(t, o)| (t.as_bytes().to_vec().into_boxed_slice(), o))
-            .collect();
+        let mut terms: Vec<(Box<[u8]>, Vec<u32>)> =
+            [("apple", vec![1]), ("applet", vec![2]), ("apply", vec![3]), ("banana", vec![4])]
+                .into_iter()
+                .map(|(t, o)| (t.as_bytes().to_vec().into_boxed_slice(), o))
+                .collect();
         write(&d, &mut terms).unwrap();
         let idx = Tsidx::open(&d).unwrap();
         let hits: Vec<String> = idx.prefix(b"appl").map(|(t, _)| String::from_utf8_lossy(t).into_owned()).collect();

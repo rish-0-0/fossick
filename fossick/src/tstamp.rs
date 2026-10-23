@@ -35,6 +35,8 @@ pub fn civil_from_days(z: i64) -> (i64, u64, u64) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+// Date components as individual args beat a one-off struct for a single internal caller.
+#[allow(clippy::too_many_arguments)]
 fn to_ms(y: i64, mo: u64, d: u64, h: u64, mi: u64, s: u64, ms: u64, tz_off_min: i64) -> Option<u64> {
     if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || s > 60 {
         return None;
@@ -86,11 +88,7 @@ fn zone(b: &[u8]) -> Option<(i64, usize)> {
         Some(&s @ (b'+' | b'-')) => {
             let sign = if s == b'+' { 1 } else { -1 };
             let h = digits(&b[1..], 2)?;
-            let (m, len) = if b.get(3) == Some(&b':') {
-                (digits(&b[4..], 2)?, 6)
-            } else {
-                (digits(&b[3..], 2)?, 5)
-            };
+            let (m, len) = if b.get(3) == Some(&b':') { (digits(&b[4..], 2)?, 6) } else { (digits(&b[3..], 2)?, 5) };
             (h <= 14 && m <= 59).then_some((sign * (h * 60 + m) as i64, len))
         }
         _ => None,
@@ -239,7 +237,7 @@ mod tests {
     fn iso_variants() {
         let cases = [
             ("2026-09-15T10:11:12Z", 1_789_467_072_000),
-            ("2026-09-15 10:11:12", 1_789_467_072_000),                       // naive → UTC
+            ("2026-09-15 10:11:12", 1_789_467_072_000), // naive → UTC
             ("2026-09-15T10:11:12.345Z", 1_789_467_072_345),
             ("2026-09-15T10:11:12+05:30", 1_789_467_072_000 - 19_800_000),
             ("2026-09-15T10:11:12-0700", 1_789_467_072_000 + 25_200_000),

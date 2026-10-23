@@ -188,11 +188,8 @@ pub fn read_events_tbl(dir: &Path) -> io::Result<Vec<(u64, u64)>> {
     let count = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
     let n = if count == 0 { (bytes.len() - 8) / 16 } else { count };
     let mut out = Vec::with_capacity(n);
-    for c in bytes[8..8 + n * 16].chunks_exact(16) {
-        out.push((
-            u64::from_le_bytes(c[0..8].try_into().unwrap()),
-            u64::from_le_bytes(c[8..16].try_into().unwrap()),
-        ));
+    for c in bytes[8..8 + n * 16].as_chunks::<16>().0 {
+        out.push((u64::from_le_bytes(c[0..8].try_into().unwrap()), u64::from_le_bytes(c[8..16].try_into().unwrap())));
     }
     Ok(out)
 }
@@ -213,10 +210,7 @@ fn write_events_tbl(dir: &Path, recs: &[(u64, u64)]) -> io::Result<()> {
 /// Rename hot_<id> → db_<max>_<min>_<id>, retrying briefly for Windows
 /// sharing violations (a searcher may hold the files open).
 fn rename_to_db(dir: &Path, man: &Manifest) -> io::Result<PathBuf> {
-    let dst = dir
-        .parent()
-        .unwrap()
-        .join(format!("db_{}_{}_{}", man.max_time_ms, man.min_time_ms, man.id));
+    let dst = dir.parent().unwrap().join(format!("db_{}_{}_{}", man.max_time_ms, man.min_time_ms, man.id));
     let mut last = None;
     for _ in 0..20 {
         match std::fs::rename(dir, &dst) {
@@ -389,7 +383,16 @@ impl BucketScan {
         if !newest_first {
             block_order.reverse(); // popped from back → ascending
         }
-        Ok(BucketScan { man, reader, newest_first, min_ms, max_ms, block_order, block: Vec::new(), current: Vec::new() })
+        Ok(BucketScan {
+            man,
+            reader,
+            newest_first,
+            min_ms,
+            max_ms,
+            block_order,
+            block: Vec::new(),
+            current: Vec::new(),
+        })
     }
 
     fn load_next_block(&mut self) -> io::Result<bool> {
@@ -465,10 +468,7 @@ mod tests {
         let dir = b.dir.clone();
 
         // Scan while still hot (reader uses the bidx sidecar).
-        let evs: Vec<OwnedEvent> = BucketScan::open(&dir, 0, u64::MAX, false)
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect();
+        let evs: Vec<OwnedEvent> = BucketScan::open(&dir, 0, u64::MAX, false).unwrap().map(|r| r.unwrap()).collect();
         assert_eq!(evs.len(), 3000);
         assert_eq!(evs[0].time_ms, 1000);
         assert_eq!(evs[0].metas, vec![(st, b"app".to_vec())]);
@@ -483,10 +483,7 @@ mod tests {
             b.add_event(1000 + i, &[], format!("e{i}").as_bytes()).unwrap();
         }
         b.flush().unwrap();
-        let times: Vec<u64> = BucketScan::open(&b.dir, 1500, 1599, true)
-            .unwrap()
-            .map(|r| r.unwrap().time_ms)
-            .collect();
+        let times: Vec<u64> = BucketScan::open(&b.dir, 1500, 1599, true).unwrap().map(|r| r.unwrap().time_ms).collect();
         assert_eq!(times.len(), 100);
         assert_eq!(times[0], 1599);
         assert_eq!(times[99], 1500);
@@ -530,10 +527,14 @@ mod tests {
         b.flush().unwrap();
         let dir = b.dir.clone();
         drop(b); // "crash": no finalize
-        // Torn final block and a corrupt events.tbl must both be repaired.
+                 // Torn final block and a corrupt events.tbl must both be repaired.
         use std::io::Write as _;
-        std::fs::OpenOptions::new().append(true).open(dir.join("journal.zj")).unwrap()
-            .write_all(b"torn-partial-block-garbage").unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("journal.zj"))
+            .unwrap()
+            .write_all(b"torn-partial-block-garbage")
+            .unwrap();
         std::fs::write(dir.join("events.tbl"), b"FET1\0\0\0\0junk").unwrap();
 
         let warm = recover_hot_dir(&dir).unwrap().unwrap();
@@ -541,7 +542,7 @@ mod tests {
         assert_eq!(man.state, State::Warm);
         assert_eq!((man.event_count, man.min_time_ms, man.max_time_ms), (2500, 1000, 3499));
         assert_eq!(read_events_tbl(&warm).unwrap().len(), 2500);
-        let n = BucketScan::open(&warm, 0, u64::MAX, false).unwrap().map(|r| r.unwrap()).count();
+        let n = BucketScan::open(&warm, 0, u64::MAX, false).unwrap().collect::<io::Result<Vec<_>>>().unwrap().len();
         assert_eq!(n, 2500);
     }
 
@@ -562,7 +563,7 @@ mod tests {
         assert_eq!(ords, vec![42]); // time 1042 → 43rd-smallest time → ordinal 42
         assert_eq!(idx.lookup(b"done").unwrap().count(), 500);
         assert!(idx.lookup(b"Alpha_42").is_none()); // terms are lowercased
-        // Composite field term (value lowercased).
+                                                    // Composite field term (value lowercased).
         assert_eq!(idx.lookup(b"sourcetype::app").unwrap().count(), 500);
 
         let bloom = crate::bloom::Bloom::open(&dir).unwrap().unwrap();

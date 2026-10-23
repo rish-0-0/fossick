@@ -72,7 +72,8 @@ where
         if bucket.max_time_ms < q.earliest || bucket.min_time_ms > q.latest {
             continue; // time-prune via db_* name
         }
-        let r = if bucket.hot { scan_bucket(&bucket.dir, q, &mut emit) } else { indexed_bucket(&bucket.dir, q, &mut emit) };
+        let r =
+            if bucket.hot { scan_bucket(&bucket.dir, q, &mut emit) } else { indexed_bucket(&bucket.dir, q, &mut emit) };
         match r {
             Ok((n, more)) => {
                 hits += n;
@@ -115,7 +116,12 @@ fn indexed_bucket<F>(dir: &Path, q: &Query, emit: &mut F) -> io::Result<(u64, bo
 where
     F: FnMut(&OwnedEvent, &[String]) -> bool,
 {
-    use fossick_index::{bloom::Bloom, bucket::{BlockCache, EventsTbl}, tokenize, tsidx::{self, Tsidx}};
+    use fossick_index::{
+        bloom::Bloom,
+        bucket::{BlockCache, EventsTbl},
+        tokenize,
+        tsidx::{self, Tsidx},
+    };
 
     let idx = match Tsidx::open(dir) {
         Ok(t) => t,

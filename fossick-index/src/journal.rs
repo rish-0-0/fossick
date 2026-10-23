@@ -216,8 +216,7 @@ pub fn recover(dir: &Path) -> io::Result<Vec<BlockEntry>> {
     }
     let mut side = Vec::new();
     File::open(&side_path)?.read_to_end(&mut side)?;
-    let blocks: Vec<BlockEntry> =
-        side.chunks_exact(ENTRY_LEN).map(BlockEntry::decode).collect();
+    let blocks: Vec<BlockEntry> = side.as_chunks::<ENTRY_LEN>().0.iter().map(|c| BlockEntry::decode(c)).collect();
     let end = blocks.last().map(|e| e.file_offset + e.comp_len as u64).unwrap_or(16);
     let mut file = OpenOptions::new().read(true).write(true).open(dir.join("journal.zj"))?;
     file.set_len(end)?; // drop a torn final block, if any
@@ -256,7 +255,7 @@ impl JournalReader {
             let mut tbl = vec![0u8; count * ENTRY_LEN];
             file.seek(SeekFrom::Start(table_offset))?;
             file.read_exact(&mut tbl)?;
-            for c in tbl.chunks_exact(ENTRY_LEN) {
+            for c in tbl.as_chunks::<ENTRY_LEN>().0 {
                 blocks.push(BlockEntry::decode(c));
             }
         } else {
@@ -268,7 +267,7 @@ impl JournalReader {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {} // empty hot journal
                 Err(e) => return Err(e),
             }
-            for c in side.chunks_exact(ENTRY_LEN) {
+            for c in side.as_chunks::<ENTRY_LEN>().0 {
                 blocks.push(BlockEntry::decode(c));
             }
         }
@@ -294,7 +293,8 @@ mod tests {
     use super::*;
 
     fn tmp() -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("fossick-jnl-{}", std::process::id()))
+        let d = std::env::temp_dir()
+            .join(format!("fossick-jnl-{}", std::process::id()))
             .join(format!("{:?}", std::thread::current().id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();

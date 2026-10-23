@@ -557,8 +557,7 @@ fn eval_primary(p: &mut P) -> Result<Expr, String> {
             }
             if p.eat_sym("(") {
                 let name = w.to_ascii_lowercase();
-                let (min, max) =
-                    fn_arity(&name).ok_or_else(|| format!("unknown function: {name}"))?;
+                let (min, max) = fn_arity(&name).ok_or_else(|| format!("unknown function: {name}"))?;
                 let mut args = Vec::new();
                 if !p.eat_sym(")") {
                     loop {
@@ -1085,7 +1084,9 @@ mod tests {
         assert_eq!(field, "msg");
         assert!(re.is_match("user=bob"));
         assert!(parse_command(r#"rex "no groups""#).is_err());
-        let Cmd::RegexFilter { field, negate, .. } = parse_command(r#"regex _raw!="^DEBUG""#).unwrap() else { panic!() };
+        let Cmd::RegexFilter { field, negate, .. } = parse_command(r#"regex _raw!="^DEBUG""#).unwrap() else {
+            panic!()
+        };
         assert_eq!(field, "_raw");
         assert!(negate);
         assert!(matches!(parse_command(r#"regex "^a""#).unwrap(), Cmd::RegexFilter { negate: false, .. }));

@@ -221,17 +221,53 @@ enum Stage {
     Eval(Vec<(String, Expr)>),
     FieldsKeep(Vec<String>),
     FieldsRemove(Vec<String>),
-    Table { spec: Vec<String>, seen: Vec<String> },
+    Table {
+        spec: Vec<String>,
+        seen: Vec<String>,
+    },
     Rename(Vec<(String, String)>),
-    Rex { field: String, re: Regex },
-    RegexFilter { field: String, re: Regex, negate: bool },
-    Fillnull { value: Value, fields: Vec<String> },
-    FillnullAll { value: Value, buf: Vec<Record>, truncated: bool },
-    Head { n: usize, seen: usize },
-    Tail { n: usize, buf: VecDeque<Record> },
-    Reverse { buf: Vec<Record>, truncated: bool },
-    Dedup { keep: usize, keys: Vec<String>, seen: HashMap<GroupKey, usize>, truncated: bool },
-    Sort { keys: Vec<(String, bool)>, limit: usize, buf: Vec<Record>, truncated: bool },
+    Rex {
+        field: String,
+        re: Regex,
+    },
+    RegexFilter {
+        field: String,
+        re: Regex,
+        negate: bool,
+    },
+    Fillnull {
+        value: Value,
+        fields: Vec<String>,
+    },
+    FillnullAll {
+        value: Value,
+        buf: Vec<Record>,
+        truncated: bool,
+    },
+    Head {
+        n: usize,
+        seen: usize,
+    },
+    Tail {
+        n: usize,
+        buf: VecDeque<Record>,
+    },
+    Reverse {
+        buf: Vec<Record>,
+        truncated: bool,
+    },
+    Dedup {
+        keep: usize,
+        keys: Vec<String>,
+        seen: HashMap<GroupKey, usize>,
+        truncated: bool,
+    },
+    Sort {
+        keys: Vec<(String, bool)>,
+        limit: usize,
+        buf: Vec<Record>,
+        truncated: bool,
+    },
     Stats {
         aggs: Vec<Agg>,
         by: Vec<String>,
@@ -390,12 +426,7 @@ impl Executor {
                 cols
             }
         };
-        let rows = self
-            .out
-            .recs
-            .iter()
-            .map(|rec| fields.iter().map(|f| rec.get_or_null(f)).collect())
-            .collect();
+        let rows = self.out.recs.iter().map(|rec| fields.iter().map(|f| rec.get_or_null(f)).collect()).collect();
         Ok(Table { fields, rows, is_aggregated: self.is_aggregated, truncated })
     }
 }
@@ -617,9 +648,7 @@ fn drain(stage: &mut Stage, limits: &Limits) -> (Vec<Record>, bool) {
             recs.reverse();
             (recs, trunc)
         }
-        Stage::Dedup { keep: 1, seen, truncated, .. } => {
-            (Vec::new(), *truncated || seen.len() >= limits.dedup_max)
-        }
+        Stage::Dedup { keep: 1, seen, truncated, .. } => (Vec::new(), *truncated || seen.len() >= limits.dedup_max),
         Stage::FillnullAll { value, buf, truncated } => {
             let recs = std::mem::take(buf);
             let mut all: Vec<String> = Vec::new();
@@ -732,13 +761,7 @@ mod tests {
         );
         assert_eq!(t.fields, vec!["host", "count"]);
         assert!(t.is_aggregated);
-        assert_eq!(
-            t.rows,
-            vec![
-                vec![Value::str("a"), Value::Num(2.0)],
-                vec![Value::str("b"), Value::Num(1.0)],
-            ]
-        );
+        assert_eq!(t.rows, vec![vec![Value::str("a"), Value::Num(2.0)], vec![Value::str("b"), Value::Num(1.0)],]);
     }
 
     #[test]
@@ -774,7 +797,10 @@ mod tests {
         let recs: Vec<Record> = ["3", "1", "2"].iter().map(|v| rec(&[("n", v)])).collect();
         let sort = Cmd::Sort { keys: vec![("n".into(), false)], limit: 0 };
         let t = run(vec![sort.clone()], recs.clone());
-        assert_eq!(t.rows.iter().map(|r| r[0].clone()).collect::<Vec<_>>(), vec![Value::str("1"), Value::str("2"), Value::str("3")]);
+        assert_eq!(
+            t.rows.iter().map(|r| r[0].clone()).collect::<Vec<_>>(),
+            vec![Value::str("1"), Value::str("2"), Value::str("3")]
+        );
 
         let t = run(vec![sort.clone(), Cmd::Head(2)], recs.clone());
         assert_eq!(t.rows.len(), 2);
@@ -791,21 +817,19 @@ mod tests {
     #[test]
     fn head_stops_the_scan() {
         let mut ex = Executor::new(Expr::Lit(Value::Bool(true)), &[Cmd::Head(1)], Limits::default(), 0);
-        assert!(ex.feed(rec(&[("a", "1")])).unwrap() == false);
+        assert!(!ex.feed(rec(&[("a", "1")])).unwrap());
     }
 
     #[test]
     fn dedup_streams_first_occurrence() {
-        let recs: Vec<Record> =
-            [("h", "a"), ("h", "b"), ("h", "a")].iter().map(|(k, v)| rec(&[(*k, *v)])).collect();
+        let recs: Vec<Record> = [("h", "a"), ("h", "b"), ("h", "a")].iter().map(|(k, v)| rec(&[(*k, *v)])).collect();
         let t = run(vec![Cmd::Dedup { keep: 1, keys: vec!["h".into()] }], recs);
         assert_eq!(t.rows.len(), 2);
     }
 
     #[test]
     fn top_counts_and_percent() {
-        let recs: Vec<Record> =
-            ["a", "a", "a", "b"].iter().map(|v| rec(&[("h", v)])).collect();
+        let recs: Vec<Record> = ["a", "a", "a", "b"].iter().map(|v| rec(&[("h", v)])).collect();
         let t = run(vec![Cmd::Top { limit: 10, fields: vec!["h".into()], by: vec![], rare: false }], recs.clone());
         assert_eq!(t.fields, vec!["h", "count", "percent"]);
         assert_eq!(t.rows[0], vec![Value::str("a"), Value::Num(3.0), Value::Num(75.0)]);
@@ -817,10 +841,8 @@ mod tests {
 
     #[test]
     fn table_orders_and_creates_columns() {
-        let t = run(
-            vec![Cmd::Table(vec!["b".into(), "missing".into(), "a".into()])],
-            vec![rec(&[("a", "1"), ("b", "2")])],
-        );
+        let t =
+            run(vec![Cmd::Table(vec!["b".into(), "missing".into(), "a".into()])], vec![rec(&[("a", "1"), ("b", "2")])]);
         assert_eq!(t.fields, vec!["b", "missing", "a"]);
         assert_eq!(t.rows[0], vec![Value::str("2"), Value::Null, Value::str("1")]);
     }
@@ -866,10 +888,7 @@ mod tests {
 
     #[test]
     fn rename_moves_values() {
-        let t = run(
-            vec![Cmd::Rename(vec![("a".into(), "z".into())])],
-            vec![rec(&[("a", "1"), ("b", "2")])],
-        );
+        let t = run(vec![Cmd::Rename(vec![("a".into(), "z".into())])], vec![rec(&[("a", "1"), ("b", "2")])]);
         assert_eq!(t.fields, vec!["z", "b"]);
     }
 

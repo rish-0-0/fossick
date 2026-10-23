@@ -59,11 +59,7 @@ fn handle(mut stream: TcpStream, conf: &Conf) -> io::Result<()> {
     }
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     let param = |name: &str| {
-        query
-            .split('&')
-            .filter_map(|kv| kv.split_once('='))
-            .find(|(k, _)| *k == name)
-            .map(|(_, v)| pct_decode(v))
+        query.split('&').filter_map(|kv| kv.split_once('=')).find(|(k, _)| *k == name).map(|(_, v)| pct_decode(v))
     };
     match path {
         "/health" => respond(&mut stream, 200, "ok\n"),
@@ -97,9 +93,7 @@ fn handle(mut stream: TcpStream, conf: &Conf) -> io::Result<()> {
                 Err(e) => return respond(&mut stream, 400, &format!("bad query: {e}\n")),
             };
             let mut w = BufWriter::new(stream);
-            w.write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n",
-            )?;
+            w.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n")?;
             let mut line = String::new();
             search::run(&conf.data_dir, &parsed, |ev, fields| {
                 line.clear();

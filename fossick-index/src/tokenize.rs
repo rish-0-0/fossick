@@ -67,7 +67,7 @@ mod tests {
         let mut input = long.clone();
         input.extend_from_slice(b" ok");
         assert_eq!(toks(&input), ["ok"]);
-        assert_eq!(toks(&vec![b'a'; 64]).len(), 1); // exactly 64 is kept
+        assert_eq!(toks(&[b'a'; 64]).len(), 1); // exactly 64 is kept
     }
 
     #[test]

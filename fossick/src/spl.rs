@@ -46,9 +46,7 @@ fn bad_input(msg: String) -> io::Error {
 /// `latest` is clamped to now. This is the hook where per-deployment policy
 /// (default windows, region tweaks) belongs.
 fn resolve_time(pipeline: &Pipeline, req: &SplRequest, now_ms: u64) -> io::Result<(u64, u64)> {
-    let spec = |s: &str| {
-        tstamp::parse_timespec(s, now_ms).ok_or_else(|| bad_input(format!("bad timespec: {s}")))
-    };
+    let spec = |s: &str| tstamp::parse_timespec(s, now_ms).ok_or_else(|| bad_input(format!("bad timespec: {s}")));
     let earliest = match pipeline.earliest.as_deref().or(req.earliest) {
         Some(s) => spec(s)?,
         None => 0,
@@ -70,13 +68,7 @@ fn pushdown_query(pipeline: &Pipeline, conf: &Conf, earliest: u64, latest: u64) 
     let indexable = serve::base_fields(conf);
     search::Query {
         terms: pipeline.pushdown.terms.clone(),
-        fields: pipeline
-            .pushdown
-            .fields
-            .iter()
-            .filter(|(f, _)| indexable.iter().any(|i| i == f))
-            .cloned()
-            .collect(),
+        fields: pipeline.pushdown.fields.iter().filter(|(f, _)| indexable.iter().any(|i| i == f)).cloned().collect(),
         earliest,
         latest,
     }
@@ -152,13 +144,11 @@ pub fn run(data_dir: &Path, conf: &Conf, req: &SplRequest, now_ms: u64) -> io::R
     let q = pushdown_query(&pipeline, conf, earliest, latest);
     let mut ex = pipeline.executor(limits_from_conf(conf), now_ms);
     let mut exec_err = None;
-    let matched = search::run(data_dir, &q, |ev, fields| {
-        match ex.feed(to_record(ev, fields)) {
-            Ok(more) => more,
-            Err(e) => {
-                exec_err = Some(e);
-                false
-            }
+    let matched = search::run(data_dir, &q, |ev, fields| match ex.feed(to_record(ev, fields)) {
+        Ok(more) => more,
+        Err(e) => {
+            exec_err = Some(e);
+            false
         }
     })?;
     if let Some(e) = exec_err {
@@ -220,11 +210,8 @@ mod tests {
 
     #[test]
     fn index_time_fields_beat_kv() {
-        let ev = OwnedEvent {
-            time_ms: 0,
-            metas: vec![(2, b"real-host".to_vec())],
-            raw: b"host=spoofed msg=x".to_vec(),
-        };
+        let ev =
+            OwnedEvent { time_ms: 0, metas: vec![(2, b"real-host".to_vec())], raw: b"host=spoofed msg=x".to_vec() };
         let fields = vec!["source".into(), "sourcetype".into(), "host".into()];
         let r = to_record(&ev, &fields);
         assert_eq!(r.get("host"), Some(&Value::str("real-host")));

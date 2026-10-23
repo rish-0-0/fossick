@@ -100,10 +100,7 @@ fn stats_global_and_dc() {
 fn eval_where_sort_head_chain() {
     let t = run("| eval kb=round(bytes/1024, 2) | where kb>0 | sort -kb | head 2 | table host kb");
     assert_eq!(t.fields, vec!["host", "kb"]);
-    assert_eq!(t.rows, vec![
-        vec![Value::str("web02"), Value::Num(4.0)],
-        vec![Value::str("web02"), Value::Num(2.0)],
-    ]);
+    assert_eq!(t.rows, vec![vec![Value::str("web02"), Value::Num(4.0)], vec![Value::str("web02"), Value::Num(2.0)],]);
 }
 
 #[test]

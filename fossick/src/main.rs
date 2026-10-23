@@ -11,9 +11,7 @@ spl: terms, field=value, earliest=/latest=, then pipes:
 conf resolution: --conf, else $FOSSICK_CONF, else ./fossick.conf, else built-in defaults";
 
 fn load_conf(explicit: Option<String>) -> Conf {
-    let path = explicit
-        .or_else(|| std::env::var("FOSSICK_CONF").ok())
-        .map(std::path::PathBuf::from);
+    let path = explicit.or_else(|| std::env::var("FOSSICK_CONF").ok()).map(std::path::PathBuf::from);
     match path {
         Some(p) => Conf::load(&p).unwrap_or_else(|e| {
             eprintln!("fossick: cannot load {}: {e}", p.display());

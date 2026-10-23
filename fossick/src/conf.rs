@@ -104,7 +104,10 @@ impl Conf {
                 ("limits", "max_results") => c.max_results = num(v)? as usize,
                 ("indexed_fields", name) => {
                     if v != "kv" {
-                        return Err(bad(n, format!("indexed field {name}: only 'kv' extraction is supported, got {v}")));
+                        return Err(bad(
+                            n,
+                            format!("indexed field {name}: only 'kv' extraction is supported, got {v}"),
+                        ));
                     }
                     c.indexed_fields.push(name.to_string());
                 }
