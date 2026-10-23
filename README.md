@@ -11,6 +11,19 @@ web UI. Rust workspace of three crates plus a React UI:
 | `fossick-spl/`  | SPL lexer, parser, and push-based executor                        |
 | `ui/`           | Web UI: Vite + React + TypeScript, TanStack Table/Virtual         |
 
+**Where this is going:** an open-source alternative to Splunk — indexer,
+search head, SPL, and a UI shell whose core apps (Search, Entity Graph) sit
+on the same app platform as user-installed `.zip` apps (like Splunk TAs).
+The multi-month plan with per-phase exit criteria lives in
+[ROADMAP.md](ROADMAP.md).
+
+**How it's built:** depth-first — one module at a time, each finished to
+production quality (complete, unit + integration tested, measured/optimized,
+documented) before the next starts. Product lifecycle over raw speed of
+delivery. [AGENTS.md](AGENTS.md) is the contract for anyone (human or
+coding agent) working here; executable playbooks live in
+[`.claude/skills/`](.claude/skills/).
+
 ## Quick start
 
 ```sh
@@ -104,6 +117,26 @@ UI (V8 coverage via `@vitest/coverage-v8`, already a dev dependency):
 ```sh
 cd ui && npm run coverage             # summary + report in ui/coverage/
 ```
+
+## Working on fossick
+
+Read [AGENTS.md](AGENTS.md) first — the depth-first methodology, the
+non-negotiable invariants (versioned on-disk formats, pushdown never changes
+semantics, crash safety, bounded reader memory, dependency-light), and the
+definition of done. Then:
+
+1. Pick work from [ROADMAP.md](ROADMAP.md) (top unchecked item, lowest
+   phase).
+2. If it's bigger than a week, decompose it with the `breakdown` skill into
+   a plan doc under `docs/plans/` and get it confirmed.
+3. Build with the `depth-first` skill; verify with `run-tests` and `verify`;
+   run `security-audit` when touching deps, ingest, HTTP, or (later) app-zip
+   code; follow `extend` when evolving any contract and `new-spl-command`
+   for SPL work; `perf` before/after any optimization.
+
+Skills are plain markdown in `.claude/skills/<name>/SKILL.md` — tools that
+don't auto-load them should read them as docs. If a skill is stale, fixing
+it is part of the change that discovered it.
 
 ## UI development
 

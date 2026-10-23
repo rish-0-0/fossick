@@ -1,5 +1,6 @@
 /target
 *.conf.local
+.claude/settings.local.json
 ui/node_modules
 ui/dist
 ui/coverage
