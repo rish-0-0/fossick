@@ -1,5 +1,6 @@
 //! TCP ingest: per-connection reader threads feed a single indexer thread
-//! that owns the hot bucket (single writer, no locks).
+//! that owns the hot bucket (single writer, no locks). Lines longer than
+//! `[limits] max_line_bytes` (default 1 MiB) are truncated before indexing.
 
 use crate::conf::{Conf, TcpInput};
 use crate::tstamp;
@@ -10,7 +11,6 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::time::Duration;
 
-const MAX_LINE: usize = 1 << 20;
 const FLUSH_EVERY: Duration = Duration::from_secs(1);
 
 pub struct IngestEvent {
@@ -41,24 +41,24 @@ pub fn run(conf: Conf) -> io::Result<()> {
     for input in conf.inputs.clone() {
         let listener = TcpListener::bind(("127.0.0.1", input.port))?;
         eprintln!("fossick: listening on 127.0.0.1:{} (sourcetype={})", input.port, input.sourcetype);
-        spawn_listener(listener, input, tx.clone());
+        spawn_listener(listener, input, conf.max_line_bytes, tx.clone());
     }
     drop(tx);
     run_indexer(&conf, rx)
 }
 
-pub fn spawn_listener(listener: TcpListener, input: TcpInput, tx: Sender<IngestEvent>) {
+pub fn spawn_listener(listener: TcpListener, input: TcpInput, max_line_bytes: usize, tx: Sender<IngestEvent>) {
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             let input = input.clone();
             let tx = tx.clone();
-            std::thread::spawn(move || handle_conn(stream, &input, tx));
+            std::thread::spawn(move || handle_conn(stream, &input, max_line_bytes, tx));
         }
     });
 }
 
 /// Read newline-delimited events from one connection until EOF.
-pub fn handle_conn(mut stream: TcpStream, input: &TcpInput, tx: Sender<IngestEvent>) {
+pub fn handle_conn(mut stream: TcpStream, input: &TcpInput, max_line_bytes: usize, tx: Sender<IngestEvent>) {
     let peer = stream.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
     let mut source: Arc<str> = input.source.as_str().into();
     let mut sourcetype: Arc<str> = input.sourcetype.as_str().into();
@@ -85,6 +85,9 @@ pub fn handle_conn(mut stream: TcpStream, input: &TcpInput, tx: Sender<IngestEve
             if line.last() == Some(&b'\r') {
                 line = &line[..line.len() - 1];
             }
+            if line.len() > max_line_bytes {
+                line = &line[..max_line_bytes];
+            }
             if line.is_empty() {
                 continue;
             }
@@ -109,9 +112,9 @@ pub fn handle_conn(mut stream: TcpStream, input: &TcpInput, tx: Sender<IngestEve
             }
         }
         buf.drain(..start);
-        if buf.len() > MAX_LINE {
-            // Oversized line: index the first MAX_LINE bytes, drop the rest.
-            let _ = send_line(&buf[..MAX_LINE], &source, &sourcetype, &host, &tx);
+        if buf.len() > max_line_bytes {
+            // Oversized line: index the first max_line_bytes, drop the rest.
+            let _ = send_line(&buf[..max_line_bytes], &source, &sourcetype, &host, &tx);
             buf.clear();
             skipping_oversize = true;
         }

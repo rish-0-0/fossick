@@ -21,6 +21,8 @@ pub struct Conf {
     pub dedup_max: usize,
     /// Cap on events returned by a non-aggregated search.
     pub max_results: usize,
+    /// Max bytes indexed per TCP line; longer lines are truncated to this length.
+    pub max_line_bytes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -53,6 +55,7 @@ impl Default for Conf {
             stats_max_groups: 100_000,
             dedup_max: 100_000,
             max_results: 10_000,
+            max_line_bytes: 1 << 20,
         }
     }
 }
@@ -102,6 +105,7 @@ impl Conf {
                 ("limits", "stats_max_groups") => c.stats_max_groups = num(v)? as usize,
                 ("limits", "dedup_max") => c.dedup_max = num(v)? as usize,
                 ("limits", "max_results") => c.max_results = num(v)? as usize,
+                ("limits", "max_line_bytes") => c.max_line_bytes = num(v)? as usize,
                 ("indexed_fields", name) => {
                     if v != "kv" {
                         return Err(bad(
@@ -155,6 +159,13 @@ mod tests {
         assert_eq!(c.inputs[0].source, "tcp:6000"); // default kept
         assert_eq!(c.indexed_fields, vec!["level"]);
         assert_eq!(c.sort_max, 5);
+        assert_eq!(c.max_line_bytes, 1 << 20);
+    }
+
+    #[test]
+    fn max_line_bytes_from_limits() {
+        let c = Conf::parse("[limits]\nmax_line_bytes = 4096\n").unwrap();
+        assert_eq!(c.max_line_bytes, 4096);
     }
 
     #[test]
