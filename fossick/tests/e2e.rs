@@ -20,9 +20,10 @@ fn ingest(conf: &Conf, input: TcpInput, header: Option<&str>, lines: &[String]) 
     let (tx, rx) = std::sync::mpsc::channel();
 
     let conn_input = input.clone();
+    let max_line_bytes = conf.max_line_bytes;
     let acceptor = std::thread::spawn(move || {
         let (stream, _) = listener.accept().unwrap();
-        serve::handle_conn(stream, &conn_input, tx); // tx dropped when conn closes
+        serve::handle_conn(stream, &conn_input, max_line_bytes, tx); // tx dropped when conn closes
     });
     let indexer = {
         let conf = conf.clone();
@@ -237,6 +238,22 @@ fn rest_api_streams_ndjson_results() {
 }
 
 #[test]
+fn oversize_line_truncated_to_max_line_bytes() {
+    let mut conf = test_conf("oversize");
+    conf.max_line_bytes = 32;
+    let input = TcpInput { port: 0, source: "s".into(), sourcetype: "st".into(), host: "h".into() };
+    let long = format!("2026-09-15T10:00:00Z marker_{}", "x".repeat(80));
+    ingest(&conf, input, None, &[long, "2026-09-15T10:00:01Z ok_line".to_string()]);
+
+    let now = tstamp::now_ms();
+    let hits = search::collect(&conf.data_dir, "marker_", now).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].1.len(), 32);
+    assert!(hits[0].1.starts_with("2026-09-15T10:00:00Z marker_"));
+    assert_eq!(search::collect(&conf.data_dir, "ok_line", now).unwrap().len(), 1);
+}
+
+#[test]
 fn crlf_blank_lines_and_no_trailing_newline() {
     let conf = test_conf("framing");
     let input = TcpInput { port: 0, source: "s".into(), sourcetype: "st".into(), host: "h".into() };
@@ -245,9 +262,10 @@ fn crlf_blank_lines_and_no_trailing_newline() {
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = std::sync::mpsc::channel();
     let conn_input = input.clone();
+    let max_line_bytes = conf.max_line_bytes;
     let acceptor = std::thread::spawn(move || {
         let (stream, _) = listener.accept().unwrap();
-        serve::handle_conn(stream, &conn_input, tx);
+        serve::handle_conn(stream, &conn_input, max_line_bytes, tx);
     });
     let indexer = {
         let conf = conf.clone();
