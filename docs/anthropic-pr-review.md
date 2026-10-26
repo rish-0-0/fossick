@@ -44,8 +44,9 @@ editing the review script.
 
 - The workflow uses `pull_request` (not `pull_request_target`) and runs only
   when `head` repo equals the base repo.
-- Pull requests from forks do not run this job (forks cannot use the parent
-  repo’s Actions secrets safely with this design).
+- Pull requests from forks **skip** this job (GitHub treats a skipped required
+  check as passing). Forks cannot use the parent repo’s Actions secrets safely
+  with this design; do not rely on this check for fork PRs.
 - Contributors with write access should use branches on the main repository for
   PRs that need this check.
 
@@ -55,7 +56,8 @@ The prompt follows [AGENTS.md](../AGENTS.md) themes: correctness, tests,
 security on ingest/HTTP and on-disk formats, no silent format breaks, minimal
 scope, and items from the security-audit skill checklist.
 
-Large diffs are truncated (200k characters) with a note in the prompt.
+Large diffs are truncated at **100k bytes**; the model is instructed to return **FAIL**
+if it cannot fully assess a truncated change.
 
 ## Troubleshooting
 
