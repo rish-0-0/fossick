@@ -1,0 +1,191 @@
+name: Anthropic PR review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  # Pin here for easy updates (see docs/anthropic-pr-review.md).
+  ANTHROPIC_MODEL: claude-sonnet-5-5
+  # Stay below Linux MAX_ARG_STRLEN; payload is sent via a temp file.
+  DIFF_CHAR_LIMIT: "100000"
+
+jobs:
+  anthropic-review:
+    name: anthropic-review
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Same-repo only: fork PRs cannot use repo secrets; avoid pull_request_target.
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.login != 'dependabot[bot]'
+    steps:
+      - name: Run Claude code review
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_WORKSPACE_ID: ${{ secrets.ANTHROPIC_WORKSPACE_ID }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+            echo "::error::Missing GitHub Actions secret ANTHROPIC_API_KEY. Add it in repository Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+
+          if ! command -v jq >/dev/null 2>&1; then
+            echo "::error::jq is required on the runner."
+            exit 1
+          fi
+
+          # Title only: PR body is often stale and is untrusted prompt input.
+          PR_META=$(gh pr view "$PR_NUMBER" --json title --jq '.title')
+          DIFF_FILE=$(mktemp)
+          if ! gh pr diff "$PR_NUMBER" > "$DIFF_FILE"; then
+            echo "::error::Failed to fetch PR diff."
+            exit 1
+          fi
+          if [ ! -s "$DIFF_FILE" ]; then
+            echo "::error::PR diff is empty."
+            exit 1
+          fi
+          TRUNCATED=false
+          DIFF_LEN=$(wc -c < "$DIFF_FILE")
+          if [ "$DIFF_LEN" -gt "$DIFF_CHAR_LIMIT" ]; then
+            head -c "$DIFF_CHAR_LIMIT" "$DIFF_FILE" > "${DIFF_FILE}.part"
+            mv "${DIFF_FILE}.part" "$DIFF_FILE"
+            TRUNCATED=true
+          fi
+
+          TRUNCATION_NOTE=""
+          if [ "$TRUNCATED" = true ]; then
+            TRUNCATION_NOTE=$'\n\n[Note: diff was truncated at '"$DIFF_CHAR_LIMIT"' bytes. If the change cannot be fully reviewed, return FAIL and say so.]'
+          fi
+
+          read -r -d '' SYSTEM_PROMPT <<'EOF' || true
+          You are a senior reviewer for the fossick repository (Rust log indexer + SPL + React UI).
+          Review the pull request diff against this rubric (from AGENTS.md and security-audit):
+
+          - Correctness: logic bugs, crash/recovery, pushdown must narrow I/O only (executor is source of truth).
+          - Tests: behavior changes should have failing-test-first coverage; edge cases for storage/format changes.
+          - Security: ingest line limits, HTTP bounds and 127.0.0.1 binding, no path traversal, bounded decompression,
+            corrupt on-disk input must error not panic; dependency additions need justification.
+          - On-disk formats: versioned contracts (magic + version); never silent layout changes.
+          - Scope: minimal diff aligned with the PR description; no unrelated refactors.
+          - Style: no new unwrap/expect on serve/ingest paths; no unsafe without justification.
+
+          Verdict rules:
+          - FAIL: any likely bug, missing tests for non-trivial behavior, security concern on threat surfaces,
+            silent format break, meaningful scope creep, or incomplete review due to truncated diff.
+          - PASS: sound change, or only minor nits/suggestions.
+
+          Workflow-only PRs: if the diff only touches `.github/workflows/` and/or `docs/`,
+          judge consistency between workflow and docs (secret names, model id, limits). Do not FAIL
+          only because the GitHub PR description text is stale; prefer PASS when the workflow and
+          docs agree and there is no security issue.
+
+          Output ONLY valid JSON (no markdown fences, no prose before/after) with exactly:
+          {"verdict":"PASS"|"FAIL","summary":"<markdown for the PR comment>"}
+          The summary should be concise markdown: headings for Critical / Suggestions / Nits as appropriate.
+          EOF
+
+          SYSTEM_FILE=$(mktemp)
+          USER_FILE=$(mktemp)
+          PAYLOAD_FILE=$(mktemp)
+          printf '%s' "$SYSTEM_PROMPT" > "$SYSTEM_FILE"
+
+          jq -nr \
+            --arg pr "$PR_NUMBER" \
+            --arg meta "$PR_META" \
+            --arg note "$TRUNCATION_NOTE" \
+            --rawfile diff "$DIFF_FILE" \
+            '"## Pull request #" + $pr + "\n\n" + $meta + $note + "\n\n## Diff\n\n```diff\n" + $diff + "\n```"' > "$USER_FILE"
+
+          jq -n \
+            --arg model "$ANTHROPIC_MODEL" \
+            --rawfile system "$SYSTEM_FILE" \
+            --rawfile user "$USER_FILE" \
+            '{
+              model: $model,
+              max_tokens: 4096,
+              system: $system,
+              messages: [{role: "user", content: $user}]
+            }' > "$PAYLOAD_FILE"
+
+          CURL_ARGS=(
+            -sS -w "\n%{http_code}"
+            --max-time 300
+            -X POST "https://api.anthropic.com/v1/messages"
+            -H "x-api-key: ${ANTHROPIC_API_KEY}"
+            -H "anthropic-version: 2023-06-01"
+            -H "content-type: application/json"
+          )
+          if [ -n "${ANTHROPIC_WORKSPACE_ID:-}" ]; then
+            CURL_ARGS+=(-H "anthropic-workspace-id: ${ANTHROPIC_WORKSPACE_ID}")
+          fi
+          CURL_ARGS+=(--data-binary "@${PAYLOAD_FILE}")
+
+          API_RESPONSE=$(curl "${CURL_ARGS[@]}") || {
+            echo "::error::Anthropic API request failed (network or curl)."
+            exit 1
+          }
+
+          BODY=$(printf '%s' "$API_RESPONSE" | sed '$d')
+          HTTP_CODE=$(printf '%s' "$API_RESPONSE" | tail -n 1)
+
+          rm -f "$DIFF_FILE" "$SYSTEM_FILE" "$USER_FILE" "$PAYLOAD_FILE"
+
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "::error::Anthropic API returned HTTP ${HTTP_CODE}."
+            printf '%s\n' "$BODY" | jq -r '.error.message // .' 2>/dev/null || true
+            exit 1
+          fi
+
+          MODEL_TEXT=$(printf '%s' "$BODY" | jq -r '[.content[] | select(.type=="text") | .text] | join("\n")')
+          if [ -z "$MODEL_TEXT" ]; then
+            echo "::error::Empty model response."
+            exit 1
+          fi
+
+          CLEAN_JSON=$(printf '%s' "$MODEL_TEXT" | python3 -c 'import sys,re; t=sys.stdin.read(); m=re.search(r"\{.*\}", t, re.S); print(m.group(0) if m else "")')
+
+          VERDICT=$(printf '%s' "$CLEAN_JSON" | jq -r '.verdict // empty' 2>/dev/null || true)
+          SUMMARY=$(printf '%s' "$CLEAN_JSON" | jq -r '.summary // empty' 2>/dev/null || true)
+
+          if [ -z "$VERDICT" ] || [ -z "$SUMMARY" ]; then
+            echo "::error::Could not parse model JSON (verdict/summary)."
+            exit 1
+          fi
+
+          case "$VERDICT" in
+            PASS|FAIL) ;;
+            *)
+              echo "::error::Invalid verdict: $VERDICT"
+              exit 1
+              ;;
+          esac
+
+          COMMENT_FILE=$(mktemp)
+          {
+            printf '## Anthropic code review (%s)\n\n' "$ANTHROPIC_MODEL"
+            printf '**Verdict: %s**\n\n' "$VERDICT"
+            printf '%s\n\n' "$SUMMARY"
+            printf '%s\n' "---"
+            printf '%s\n' "_Automated review; required check \`anthropic-review\` fails on FAIL. Not a substitute for human review._"
+          } > "$COMMENT_FILE"
+
+          gh pr comment "$PR_NUMBER" --body-file "$COMMENT_FILE"
+          rm -f "$COMMENT_FILE"
+
+          if [ "$VERDICT" = "FAIL" ]; then
+            echo "::error::Claude review verdict: FAIL"
+            exit 1
+          fi
+
+          echo "Claude review verdict: PASS"
