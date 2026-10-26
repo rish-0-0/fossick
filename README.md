@@ -45,8 +45,8 @@ cargo run -p fossick -- search "error | top 5 svc"
 Configuration is read from `--conf <path>`, else `$FOSSICK_CONF`, else
 `./fossick.conf`, else built-in defaults. See `fossick/src/conf.rs` for the
 sections (`[general]`, `[bucket]`, `[input:tcp:<port>]`, `[indexed_fields]`,
-`[limits]`). `[limits] max_line_bytes` (default 1 MiB) caps how much of each
-TCP line is indexed; longer lines are truncated.
+`[limits]`). `[limits] max_line_bytes` (default 1 MiB) caps how much of each TCP line is
+indexed; longer lines are truncated. TCP lines are opaque bytes—invalid UTF-8 is stored as-is.
 
 ## Architecture notes
 
@@ -88,6 +88,8 @@ Known gaps (documented, not silent): no `timechart`/`bin`/`eventstats`/
 `streamstats`/subsearches, no multivalue functions, no `strftime`/`strptime`
 (`_time` is an ISO-8601 string, so lexicographic order is chronological).
 Fields are auto-extracted from `_raw` as `key=value` at search time.
+Ingest stores raw bytes; invalid UTF-8 is preserved on disk but search/API strings
+use lossy conversion, so distinct invalid sequences may look identical in results.
 
 ## Tests
 

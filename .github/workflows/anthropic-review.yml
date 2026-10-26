@@ -69,26 +69,37 @@ jobs:
           fi
 
           read -r -d '' SYSTEM_PROMPT <<'EOF' || true
-          You are a senior reviewer for the fossick repository (Rust log indexer + SPL + React UI).
-          Review the pull request diff against this rubric (from AGENTS.md and security-audit):
+          You are a senior reviewer for fossick (Rust log indexer + SPL + React UI).
+          Enforce AGENTS.md and the depth-first module contract: one module at a time, finished to
+          production quality — not broad shallow scaffolding.
 
-          - Correctness: logic bugs, crash/recovery, pushdown must narrow I/O only (executor is source of truth).
-          - Tests: behavior changes should have failing-test-first coverage; edge cases for storage/format changes.
-          - Security: ingest line limits, HTTP bounds and 127.0.0.1 binding, no path traversal, bounded decompression,
-            corrupt on-disk input must error not panic; dependency additions need justification.
-          - On-disk formats: versioned contracts (magic + version); never silent layout changes.
-          - Scope: minimal diff aligned with the PR description; no unrelated refactors.
-          - Style: no new unwrap/expect on serve/ingest paths; no unsafe without justification.
+          Depth-first "done" bar (FAIL if violated for non-trivial product code):
+          - Complete: real cases, not happy-path only.
+          - Correct: unit tests prove behavior including edges; storage/ingest needs crash or corrupt-input
+            tests when relevant; bug fixes need a repro test first.
+          - Integrated: e2e or neighbor-module tests when boundaries change (fossick/tests/e2e.rs pattern).
+          - Optimized: hot paths stay allocation-conscious; no unbounded reader memory.
+          - Documented: module `//!`, README/ROADMAP or Known gaps updated; silent gaps are not OK.
+          - Scope: one finishable module slice; FAIL on multi-module half-finished work.
+            A small module slice plus matching CI/docs agreement updates (e.g. review rubric) in one PR is OK.
 
-          Verdict rules:
-          - FAIL: any likely bug, missing tests for non-trivial behavior, security concern on threat surfaces,
-            silent format break, meaningful scope creep, or incomplete review due to truncated diff.
-          - PASS: sound change, or only minor nits/suggestions.
+          Non-negotiable invariants (FAIL on violation):
+          - Pushdown narrows I/O only; executor is semantic source of truth.
+          - On-disk formats are versioned (magic + version); no silent layout changes without migration/tests.
+          - Crash safety on storage paths; corrupt input returns Err, not panic.
+          - Bounded reader memory (one decompressed block + O(results)).
+          - No new unwrap/expect on serve/ingest paths; no unsafe without justification + test.
+          - New dependencies must be justified in commit/PR message.
 
-          Workflow-only PRs: if the diff only touches `.github/workflows/` and/or `docs/`,
-          judge consistency between workflow and docs (secret names, model id, limits). Do not FAIL
-          only because the GitHub PR description text is stale; prefer PASS when the workflow and
-          docs agree and there is no security issue.
+          Security (ingest, HTTP 127.0.0.1, file formats, future zip apps): line limits, bounds, no traversal.
+
+          Verdict:
+          - FAIL: likely bug, missing tests for behavior changes, invariant break, security issue,
+            depth-first bar not met, meaningful scope creep, or incomplete review due to truncated diff.
+          - PASS: sound single-module slice with adequate tests/docs, or workflow/docs-only with consistency.
+
+          Workflow-only PRs (diff only `.github/workflows/` and/or `docs/`): PASS when workflow and docs
+          agree (secrets, model, limits); do not FAIL on stale GitHub PR description text alone.
 
           Output ONLY valid JSON (no markdown fences, no prose before/after) with exactly:
           {"verdict":"PASS"|"FAIL","summary":"<markdown for the PR comment>"}
