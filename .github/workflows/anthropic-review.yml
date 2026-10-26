@@ -10,7 +10,7 @@ permissions:
 
 env:
   # Pin here for easy updates (see docs/anthropic-pr-review.md).
-  ANTHROPIC_MODEL: claude-sonnet-4-20250514
+  ANTHROPIC_MODEL: claude-sonnet-5-5
   DIFF_CHAR_LIMIT: "200000"
 
 jobs:

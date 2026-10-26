@@ -37,7 +37,7 @@ not approve or dismiss reviews; it only comments and sets job status.
 ## Model
 
 The model ID is pinned in the workflow `env` as `ANTHROPIC_MODEL` (currently
-`claude-sonnet-4-20250514`). Change that variable to switch models without
+`claude-sonnet-5-5`). Change that variable to switch models without
 editing the review script.
 
 ## Fork and cross-repo limitations
