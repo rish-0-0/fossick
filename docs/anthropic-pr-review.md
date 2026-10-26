@@ -64,6 +64,7 @@ Large diffs are truncated (200k characters) with a note in the prompt.
 | Job skipped | PR is from a fork or external head repo |
 | Missing secret error | Add `ANTHROPIC_API_KEY` in Actions secrets |
 | HTTP 400 workspace id | Add `ANTHROPIC_WORKSPACE_ID` or use a workspace-scoped key |
+| HTTP 404 model | Update `ANTHROPIC_MODEL` in the workflow to a valid API id (e.g. `claude-sonnet-5-5`) |
 | API HTTP error | Key invalid, billing, or model ID unavailable |
 | Parse error | Model returned non-JSON; re-run the workflow |
 
