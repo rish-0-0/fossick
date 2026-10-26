@@ -10,7 +10,7 @@ exposes a CI check you can mark as required.
    the Messages API.
 2. In GitHub: **Settings → Secrets and variables → Actions → New repository
    secret**
-   - Name: `ANTHROPIC_API_SECRET` (GitHub treats secret names as
+   - Name: `ANTHROPIC_API_KEY` (GitHub treats secret names as
      case-insensitive; use this conventional name in docs and workflows.)
    - Value: your API key (never commit it to the repo).
 3. Open or update a pull request; the **Anthropic PR review** workflow runs on
@@ -57,7 +57,7 @@ Large diffs are truncated (200k characters) with a note in the prompt.
 | Symptom | Likely cause |
 | -------- | ------------- |
 | Job skipped | PR is from a fork or external head repo |
-| Missing secret error | Add `ANTHROPIC_API_SECRET` in Actions secrets |
+| Missing secret error | Add `ANTHROPIC_API_KEY` in Actions secrets |
 | API HTTP error | Key invalid, billing, or model ID unavailable |
 | Parse error | Model returned non-JSON; re-run the workflow |
 

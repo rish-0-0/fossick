@@ -26,14 +26,14 @@ jobs:
 
       - name: Run Claude code review
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_SECRET }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
 
           if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
-            echo "::error::Missing GitHub Actions secret ANTHROPIC_API_SECRET. Add it in repository Settings → Secrets and variables → Actions."
+            echo "::error::Missing GitHub Actions secret ANTHROPIC_API_KEY. Add it in repository Settings → Secrets and variables → Actions."
             exit 1
           fi
 
