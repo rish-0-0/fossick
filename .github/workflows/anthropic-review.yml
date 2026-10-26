@@ -44,18 +44,17 @@ jobs:
             exit 1
           fi
 
-          PR_META=$(gh pr view "$PR_NUMBER" --json title,body --jq '[.title, .body] | join("\n\n")')
-          if ! DIFF=$(gh pr diff "$PR_NUMBER"); then
+          # Title only: PR body is often stale and is untrusted prompt input.
+          PR_META=$(gh pr view "$PR_NUMBER" --json title --jq '.title')
+          DIFF_FILE=$(mktemp)
+          if ! gh pr diff "$PR_NUMBER" > "$DIFF_FILE"; then
             echo "::error::Failed to fetch PR diff."
             exit 1
           fi
-          if [ -z "$DIFF" ]; then
+          if [ ! -s "$DIFF_FILE" ]; then
             echo "::error::PR diff is empty."
             exit 1
           fi
-
-          DIFF_FILE=$(mktemp)
-          printf '%s' "$DIFF" > "$DIFF_FILE"
           TRUNCATED=false
           DIFF_LEN=$(wc -c < "$DIFF_FILE")
           if [ "$DIFF_LEN" -gt "$DIFF_CHAR_LIMIT" ]; then
@@ -85,6 +84,11 @@ jobs:
           - FAIL: any likely bug, missing tests for non-trivial behavior, security concern on threat surfaces,
             silent format break, meaningful scope creep, or incomplete review due to truncated diff.
           - PASS: sound change, or only minor nits/suggestions.
+
+          Workflow-only PRs: if the diff only touches `.github/workflows/` and/or `docs/`,
+          judge consistency between workflow and docs (secret names, model id, limits). Do not FAIL
+          only because the GitHub PR description text is stale; prefer PASS when the workflow and
+          docs agree and there is no security issue.
 
           Output ONLY valid JSON (no markdown fences, no prose before/after) with exactly:
           {"verdict":"PASS"|"FAIL","summary":"<markdown for the PR comment>"}
