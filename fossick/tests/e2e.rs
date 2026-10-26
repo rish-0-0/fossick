@@ -255,9 +255,7 @@ fn invalid_utf8_preserves_bytes_through_index_and_search() {
         std::thread::spawn(move || serve::run_indexer(&conf, rx))
     };
     let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    client
-        .write_all(b"2026-09-15T10:00:00Z uniq_utf8\xff\xfe_marker\n")
-        .unwrap();
+    client.write_all(b"2026-09-15T10:00:00Z uniq_utf8\xff\xfe_marker\n").unwrap();
     drop(client);
     acceptor.join().unwrap();
     indexer.join().unwrap().unwrap();
