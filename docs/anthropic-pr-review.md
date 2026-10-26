@@ -10,10 +10,15 @@ exposes a CI check you can mark as required.
    the Messages API.
 2. In GitHub: **Settings → Secrets and variables → Actions → New repository
    secret**
-   - Name: `ANTHROPIC_API_KEY` (GitHub treats secret names as
-     case-insensitive; use this conventional name in docs and workflows.)
+   - Name: `ANTHROPIC_API_KEY`
    - Value: your API key (never commit it to the repo).
-3. Open or update a pull request; the **Anthropic PR review** workflow runs on
+3. If Anthropic returns an error about **workspace id**, add another repository
+   secret:
+   - Name: `ANTHROPIC_WORKSPACE_ID`
+   - Value: workspace ID from [Anthropic Console](https://console.anthropic.com/)
+     (organization/workspace settings). Alternatively, create an API key that is
+     already scoped to one workspace.
+4. Open or update a pull request; the **Anthropic PR review** workflow runs on
    `opened`, `synchronize`, and `reopened`.
 
 ## Required check (branch protection)
@@ -58,6 +63,7 @@ Large diffs are truncated (200k characters) with a note in the prompt.
 | -------- | ------------- |
 | Job skipped | PR is from a fork or external head repo |
 | Missing secret error | Add `ANTHROPIC_API_KEY` in Actions secrets |
+| HTTP 400 workspace id | Add `ANTHROPIC_WORKSPACE_ID` or use a workspace-scoped key |
 | API HTTP error | Key invalid, billing, or model ID unavailable |
 | Parse error | Model returned non-JSON; re-run the workflow |
 

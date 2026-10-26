@@ -27,6 +27,8 @@ jobs:
       - name: Run Claude code review
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Required for API keys not scoped to a single workspace (Anthropic console).
+          ANTHROPIC_WORKSPACE_ID: ${{ secrets.ANTHROPIC_WORKSPACE_ID }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
@@ -96,13 +98,20 @@ jobs:
               messages: [{role: "user", content: $user}]
             }')
 
+          CURL_ARGS=(
+            -sS -w "\n%{http_code}"
+            -X POST "https://api.anthropic.com/v1/messages"
+            -H "x-api-key: ${ANTHROPIC_API_KEY}"
+            -H "anthropic-version: 2023-06-01"
+            -H "content-type: application/json"
+          )
+          if [ -n "${ANTHROPIC_WORKSPACE_ID:-}" ]; then
+            CURL_ARGS+=(-H "anthropic-workspace-id: ${ANTHROPIC_WORKSPACE_ID}")
+          fi
+          CURL_ARGS+=(-d "$PAYLOAD")
+
           HTTP_CODE=0
-          API_RESPONSE=$(curl -sS -w "\n%{http_code}" \
-            -X POST "https://api.anthropic.com/v1/messages" \
-            -H "x-api-key: ${ANTHROPIC_API_KEY}" \
-            -H "anthropic-version: 2023-06-01" \
-            -H "content-type: application/json" \
-            -d "$PAYLOAD") || {
+          API_RESPONSE=$(curl "${CURL_ARGS[@]}") || {
             echo "::error::Anthropic API request failed (network or curl)."
             exit 1
           }
