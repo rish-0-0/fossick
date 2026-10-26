@@ -1,6 +1,10 @@
 //! TCP ingest: per-connection reader threads feed a single indexer thread
 //! that owns the hot bucket (single writer, no locks). Lines longer than
 //! `[limits] max_line_bytes` (default 1 MiB) are truncated before indexing.
+//!
+//! **UTF-8 policy:** ingest treats each line as opaque bytes. Invalid UTF-8 is
+//! stored verbatim in the journal; search/API display uses lossy UTF-8 conversion
+//! (`from_utf8_lossy`) and does not reject or rewrite bytes at ingest time.
 
 use crate::conf::{Conf, TcpInput};
 use crate::tstamp;
@@ -217,6 +221,18 @@ pub fn kv_extract<'a>(raw: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_utf8_line_bytes_preserved() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let source: Arc<str> = "s".into();
+        let st: Arc<str> = "st".into();
+        let host: Arc<str> = "h".into();
+        let line = b"2026-09-15T10:00:00Z needle\xff\xfe";
+        send_line(line, &source, &st, &host, &tx).unwrap();
+        let ev = rx.recv().unwrap();
+        assert_eq!(ev.raw, line);
+    }
 
     #[test]
     fn kv_extraction() {

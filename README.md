@@ -45,7 +45,7 @@ cargo run -p fossick -- search "error | top 5 svc"
 Configuration is read from `--conf <path>`, else `$FOSSICK_CONF`, else
 `./fossick.conf`, else built-in defaults. See `fossick/src/conf.rs` for the
 sections (`[general]`, `[bucket]`, `[input:tcp:<port>]`, `[indexed_fields]`,
-`[limits]`). `[limits] max_line_bytes` (default 1 MiB) caps how much of each
+`[limits]`). `[limits] max_line_bytes` (TCP lines are opaque bytes; invalid UTF-8 is stored as-is) (default 1 MiB) caps how much of each
 TCP line is indexed; longer lines are truncated.
 
 ## Architecture notes

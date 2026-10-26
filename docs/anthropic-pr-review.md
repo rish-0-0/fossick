@@ -52,9 +52,10 @@ editing the review script.
 
 ## What Claude checks
 
-The prompt follows [AGENTS.md](../AGENTS.md) themes: correctness, tests,
-security on ingest/HTTP and on-disk formats, no silent format breaks, minimal
-scope, and items from the security-audit skill checklist.
+The prompt enforces [AGENTS.md](../AGENTS.md) **depth-first** module quality:
+complete / correct (tests first) / integrated / documented, fossick invariants
+(pushdown, versioned formats, crash safety, bounded memory), minimal single-module
+scope, and security on ingest/HTTP/formats. Broad shallow scaffolding should FAIL.
 
 Large diffs are truncated at **100k bytes**; the model is instructed to return **FAIL**
 if it cannot fully assess a truncated change.
