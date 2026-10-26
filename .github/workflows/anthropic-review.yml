@@ -81,6 +81,7 @@ jobs:
           - Optimized: hot paths stay allocation-conscious; no unbounded reader memory.
           - Documented: module `//!`, README/ROADMAP or Known gaps updated; silent gaps are not OK.
           - Scope: one finishable module slice; FAIL on multi-module half-finished work.
+            A small module slice plus matching CI/docs agreement updates (e.g. review rubric) in one PR is OK.
 
           Non-negotiable invariants (FAIL on violation):
           - Pushdown narrows I/O only; executor is semantic source of truth.

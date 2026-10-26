@@ -238,6 +238,38 @@ fn rest_api_streams_ndjson_results() {
 }
 
 #[test]
+fn invalid_utf8_preserves_bytes_through_index_and_search() {
+    let conf = test_conf("utf8");
+    let input = TcpInput { port: 0, source: "s".into(), sourcetype: "st".into(), host: "h".into() };
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let conn_input = input.clone();
+    let max_line_bytes = conf.max_line_bytes;
+    let acceptor = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        serve::handle_conn(stream, &conn_input, max_line_bytes, tx);
+    });
+    let indexer = {
+        let conf = conf.clone();
+        std::thread::spawn(move || serve::run_indexer(&conf, rx))
+    };
+    let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    client
+        .write_all(b"2026-09-15T10:00:00Z uniq_utf8\xff\xfe_marker\n")
+        .unwrap();
+    drop(client);
+    acceptor.join().unwrap();
+    indexer.join().unwrap().unwrap();
+
+    let hits = search::collect(&conf.data_dir, "uniq_utf8", tstamp::now_ms()).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert!(hits[0].1.contains("uniq_utf8"));
+    // Search path uses lossy UTF-8 for display; invalid bytes become U+FFFD.
+    assert!(hits[0].1.contains('\u{FFFD}'));
+}
+
+#[test]
 fn oversize_line_truncated_to_max_line_bytes() {
     let mut conf = test_conf("oversize");
     conf.max_line_bytes = 32;
