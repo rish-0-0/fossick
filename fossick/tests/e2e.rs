@@ -23,7 +23,7 @@ fn ingest(conf: &Conf, input: TcpInput, header: Option<&str>, lines: &[String]) 
     let max_line_bytes = conf.max_line_bytes;
     let acceptor = std::thread::spawn(move || {
         let (stream, _) = listener.accept().unwrap();
-        serve::handle_conn(stream, &conn_input, max_line_bytes, tx); // tx dropped when conn closes
+        serve::handle_conn(stream, &conn_input, max_line_bytes, tx, serve::Shutdown::new());
     });
     let indexer = {
         let conf = conf.clone();
@@ -248,7 +248,7 @@ fn invalid_utf8_preserves_bytes_through_index_and_search() {
     let max_line_bytes = conf.max_line_bytes;
     let acceptor = std::thread::spawn(move || {
         let (stream, _) = listener.accept().unwrap();
-        serve::handle_conn(stream, &conn_input, max_line_bytes, tx);
+        serve::handle_conn(stream, &conn_input, max_line_bytes, tx, serve::Shutdown::new());
     });
     let indexer = {
         let conf = conf.clone();
@@ -295,7 +295,7 @@ fn crlf_blank_lines_and_no_trailing_newline() {
     let max_line_bytes = conf.max_line_bytes;
     let acceptor = std::thread::spawn(move || {
         let (stream, _) = listener.accept().unwrap();
-        serve::handle_conn(stream, &conn_input, max_line_bytes, tx);
+        serve::handle_conn(stream, &conn_input, max_line_bytes, tx, serve::Shutdown::new());
     });
     let indexer = {
         let conf = conf.clone();
@@ -311,6 +311,102 @@ fn crlf_blank_lines_and_no_trailing_newline() {
     let raws: Vec<&str> = hits.iter().map(|(_, r)| r.as_str()).collect();
     assert_eq!(hits.len(), 2);
     assert!(raws.contains(&"first line") && raws.contains(&"second line"));
+}
+
+#[test]
+fn graceful_shutdown_drains_in_flight_events() {
+    let conf = test_conf("graceful-shutdown");
+    let shutdown = serve::Shutdown::new();
+    let input = TcpInput { port: 0, source: "s".into(), sourcetype: "st".into(), host: "h".into() };
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let listener_thread = serve::spawn_listener(listener, input, conf.max_line_bytes, tx, shutdown.clone());
+    let indexer = std::thread::spawn({
+        let conf = conf.clone();
+        move || serve::run_indexer(&conf, rx)
+    });
+
+    const N: usize = 150;
+    let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    for i in 0..N {
+        writeln!(client, "2026-09-15T10:00:{:02}Z graceful_evt_{}", i % 60, i).unwrap();
+    }
+    client.flush().unwrap();
+    std::thread::sleep(serve::READ_POLL + std::time::Duration::from_millis(100));
+    shutdown.request();
+    listener_thread.join().unwrap();
+    // Client stays open (long-lived shipper); readers must still exit and drain.
+    indexer.join().unwrap().unwrap();
+    drop(client);
+
+    let hits = search::collect(&conf.data_dir, "graceful_evt_", tstamp::now_ms()).unwrap();
+    assert_eq!(hits.len(), N);
+}
+
+#[test]
+#[cfg(unix)]
+fn serve_sigterm_drains_ingested_events() {
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    let dir = std::env::temp_dir().join(format!("fossick-e2e-sigterm-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ingest_port = {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    };
+    let conf_path = dir.join("fossick.conf");
+    std::fs::write(
+        &conf_path,
+        format!("[general]\ndata_dir = {}\napi_port = 0\n\n[input:tcp:{}]\n", dir.display(), ingest_port),
+    )
+    .unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_fossick");
+    assert!(std::path::Path::new(bin).exists(), "fossick binary missing at {bin}");
+    let child = Command::new(bin)
+        .args(["serve", "--conf", &conf_path.to_string_lossy()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let mut client = {
+        let mut stream = None;
+        for _ in 0..100 {
+            if let Ok(s) = TcpStream::connect(("127.0.0.1", ingest_port)) {
+                stream = Some(s);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        stream.expect("fossick serve did not start listening")
+    };
+
+    const N: usize = 25;
+    for i in 0..N {
+        writeln!(client, "2026-09-15T10:00:{:02}Z sigterm_proc_{}", i % 60, i).unwrap();
+    }
+    client.flush().unwrap();
+
+    serve::send_sigterm_to_process(child.id()).expect("SIGTERM");
+    let out = child.wait_with_output().expect("wait");
+    assert!(out.status.success(), "serve should exit 0 after SIGTERM drain");
+    drop(client);
+
+    let conf = Conf { data_dir: dir, api_port: 0, indexed_fields: vec![], ..Conf::default() };
+    let hits = search::collect(&conf.data_dir, "sigterm_proc_", tstamp::now_ms()).unwrap();
+    assert_eq!(
+        hits.len(),
+        N,
+        "serve stderr:\n{}\nstdout:\n{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
 }
 
 #[test]

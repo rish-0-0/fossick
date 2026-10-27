@@ -7,3 +7,5 @@ license.workspace = true
 [dependencies]
 fossick-index = { path = "../fossick-index" }
 fossick-spl = { path = "../fossick-spl" }
+# Unix SIGINT/SIGTERM via sigaction (already in the lockfile via zstd/memmap2).
+libc = "0.2"

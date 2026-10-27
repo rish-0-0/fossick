@@ -2,6 +2,13 @@
 //! that owns the hot bucket (single writer, no locks). Lines longer than
 //! `[limits] max_line_bytes` (default 1 MiB) are truncated before indexing.
 //!
+//! **Graceful shutdown:** `fossick serve` installs a SIGINT/SIGTERM handler that
+//! stops accepting new TCP connections (the accept backlog is drained once),
+//! reads each ingest socket until idle or a post-shutdown drain budget elapses,
+//! drains the ingest queue, flushes the hot
+//! bucket, then exits. The HTTP API thread is not joined (loopback-only today).
+//! Abrupt kill (`kill -9`) may lose at most the current unflushed journal block.
+//!
 //! **UTF-8 policy:** ingest treats each line as opaque bytes. Invalid UTF-8 is
 //! stored verbatim in the journal; search/API display uses lossy UTF-8 conversion
 //! (`from_utf8_lossy`) and does not reject or rewrite bytes at ingest time.
@@ -11,11 +18,126 @@ use crate::tstamp;
 use fossick_index::bucket::{HotBucket, RollLimits};
 use std::io::{self, Read};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 const FLUSH_EVERY: Duration = Duration::from_secs(1);
+const ACCEPT_POLL: Duration = Duration::from_millis(50);
+/// Read poll interval for ingest connections (exported for integration tests).
+pub const READ_POLL: Duration = Duration::from_millis(100);
+/// Max time to keep reading an ingest socket after shutdown is requested.
+const DRAIN_BUDGET: Duration = Duration::from_secs(3);
+
+/// Cooperative shutdown flag shared by listeners and `fossick serve`.
+#[derive(Clone)]
+pub struct Shutdown {
+    flag: Arc<AtomicBool>,
+}
+
+impl Default for Shutdown {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Shutdown {
+    pub fn new() -> Self {
+        Self { flag: Arc::new(AtomicBool::new(false)) }
+    }
+
+    pub fn requested(&self) -> bool {
+        self.flag.load(Ordering::Acquire)
+    }
+
+    pub fn request(&self) {
+        self.flag.store(true, Ordering::Release);
+    }
+}
+
+/// SIGINT/SIGTERM request graceful ingest drain (Unix only; no-op elsewhere).
+pub fn install_shutdown_handler(shutdown: Shutdown) {
+    shutdown_signals::install(shutdown);
+}
+
+/// Send SIGTERM to a child `fossick serve` process (Unix only).
+#[cfg(unix)]
+pub fn send_sigterm_to_process(pid: u32) -> io::Result<()> {
+    // SAFETY: `kill` with SIGTERM is the standard graceful-stop syscall.
+    if unsafe { libc::kill(pid as i32, libc::SIGTERM) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+mod shutdown_signals {
+    use super::Shutdown;
+    use libc::{c_int, sigaction, sigemptyset, sigset_t, SA_RESTART, SIGINT, SIGTERM};
+    use std::mem::MaybeUninit;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, OnceLock};
+
+    static FLAG: OnceLock<Arc<std::sync::atomic::AtomicBool>> = OnceLock::new();
+    static SIGNAL_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    extern "C" fn on_signal(sig: c_int) {
+        if let Some(flag) = FLAG.get() {
+            flag.store(true, Ordering::Release);
+        }
+        if SIGNAL_COUNT.fetch_add(1, Ordering::Relaxed) > 0 {
+            // SAFETY: restore default disposition then re-raise so a stuck drain stays killable.
+            unsafe {
+                libc::signal(sig, libc::SIG_DFL);
+                libc::raise(sig);
+            }
+        }
+    }
+
+    pub fn install(shutdown: Shutdown) {
+        // Only the first `Shutdown` flag is wired; later installs are ignored.
+        let _ = FLAG.set(shutdown.flag);
+        let sa = new_sigaction();
+        for sig in [SIGINT, SIGTERM] {
+            // SAFETY: `sa` points at a valid `sigaction`; prior handlers are replaced.
+            if unsafe { sigaction(sig, &sa, std::ptr::null_mut()) } != 0 {
+                eprintln!("fossick: warning: could not install handler for signal {sig}");
+            }
+        }
+        eprintln!("fossick: press Ctrl+C or send SIGTERM for graceful shutdown");
+    }
+
+    fn new_sigaction() -> libc::sigaction {
+        // SAFETY: `sigaction` is zeroed then fully initialized before use.
+        let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
+        sa.sa_sigaction = on_signal as *const () as usize;
+        sa.sa_mask = empty_sigset();
+        sa.sa_flags = SA_RESTART;
+        #[cfg(target_os = "linux")]
+        {
+            sa.sa_restorer = None;
+        }
+        sa
+    }
+
+    fn empty_sigset() -> sigset_t {
+        let mut set = MaybeUninit::<sigset_t>::uninit();
+        // SAFETY: `sigemptyset` initializes `set` on success (always for a fresh set).
+        unsafe {
+            sigemptyset(set.as_mut_ptr());
+            set.assume_init()
+        }
+    }
+}
+
+#[cfg(not(unix))]
+mod shutdown_signals {
+    use super::Shutdown;
+
+    pub fn install(_shutdown: Shutdown) {}
+}
 
 pub struct IngestEvent {
     pub time_ms: u64,
@@ -36,33 +158,81 @@ pub fn base_fields(conf: &Conf) -> Vec<String> {
 }
 
 pub fn run(conf: Conf) -> io::Result<()> {
+    let shutdown = Shutdown::new();
+    install_shutdown_handler(shutdown.clone());
     if conf.api_port != 0 {
         let api = TcpListener::bind(("127.0.0.1", conf.api_port))?;
         eprintln!("fossick: web UI + search API on http://127.0.0.1:{}/", conf.api_port);
         crate::http::spawn(api, conf.clone());
     }
     let (tx, rx) = std::sync::mpsc::channel();
+    let mut listeners = Vec::new();
     for input in conf.inputs.clone() {
         let listener = TcpListener::bind(("127.0.0.1", input.port))?;
         eprintln!("fossick: listening on 127.0.0.1:{} (sourcetype={})", input.port, input.sourcetype);
-        spawn_listener(listener, input, conf.max_line_bytes, tx.clone());
+        listeners.push(spawn_listener(listener, input, conf.max_line_bytes, tx.clone(), shutdown.clone()));
     }
     drop(tx);
-    run_indexer(&conf, rx)
+    run_indexer(&conf, rx)?;
+    for h in listeners {
+        let _ = h.join();
+    }
+    Ok(())
 }
 
-pub fn spawn_listener(listener: TcpListener, input: TcpInput, max_line_bytes: usize, tx: Sender<IngestEvent>) {
+pub fn spawn_listener(
+    listener: TcpListener,
+    input: TcpInput,
+    max_line_bytes: usize,
+    tx: Sender<IngestEvent>,
+    shutdown: Shutdown,
+) -> JoinHandle<()> {
     std::thread::spawn(move || {
-        for stream in listener.incoming().flatten() {
+        if listener.set_nonblocking(true).is_err() {
+            eprintln!("fossick: cannot set listener non-blocking; ingest thread exiting");
+            return;
+        }
+        let accept_one = |stream: TcpStream| {
+            if stream.set_nonblocking(false).is_err() {
+                eprintln!("fossick: cannot set connection blocking; dropping client");
+                return;
+            }
             let input = input.clone();
             let tx = tx.clone();
-            std::thread::spawn(move || handle_conn(stream, &input, max_line_bytes, tx));
+            let conn_shutdown = shutdown.clone();
+            std::thread::spawn(move || handle_conn(stream, &input, max_line_bytes, tx, conn_shutdown));
+        };
+        while !shutdown.requested() {
+            match listener.accept() {
+                Ok((stream, _)) => accept_one(stream),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(ACCEPT_POLL);
+                }
+                Err(e) => {
+                    eprintln!("fossick: accept error (retrying): {e}");
+                    std::thread::sleep(ACCEPT_POLL);
+                }
+            }
         }
-    });
+        // Accept connections already in the backlog so their readers keep a sender clone.
+        while let Ok((stream, _)) = listener.accept() {
+            accept_one(stream);
+        }
+    })
 }
 
-/// Read newline-delimited events from one connection until EOF.
-pub fn handle_conn(mut stream: TcpStream, input: &TcpInput, max_line_bytes: usize, tx: Sender<IngestEvent>) {
+/// Read newline-delimited events from one connection until EOF or graceful shutdown.
+pub fn handle_conn(
+    mut stream: TcpStream,
+    input: &TcpInput,
+    max_line_bytes: usize,
+    tx: Sender<IngestEvent>,
+    shutdown: Shutdown,
+) {
+    if stream.set_read_timeout(Some(READ_POLL)).is_err() {
+        eprintln!("fossick: cannot set read timeout; closing ingest connection");
+        return;
+    }
     let peer = stream.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
     let mut source: Arc<str> = input.source.as_str().into();
     let mut sourcetype: Arc<str> = input.sourcetype.as_str().into();
@@ -72,9 +242,32 @@ pub fn handle_conn(mut stream: TcpStream, input: &TcpInput, max_line_bytes: usiz
     let mut chunk = [0u8; 64 * 1024];
     let mut first_line = true;
     let mut skipping_oversize = false;
+    let mut draining = false;
+    let mut drain_until = None;
     loop {
+        if shutdown.requested() {
+            draining = true;
+            if drain_until.is_none() {
+                drain_until = Some(std::time::Instant::now() + DRAIN_BUDGET);
+            }
+        }
+        if draining && drain_until.is_some_and(|t| std::time::Instant::now() >= t) {
+            break;
+        }
         let n = match stream.read(&mut chunk) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
+                ) =>
+            {
+                if draining {
+                    break;
+                }
+                continue;
+            }
+            Err(_) => break,
             Ok(n) => n,
         };
         buf.extend_from_slice(&chunk[..n]);
@@ -168,20 +361,10 @@ pub fn run_indexer(conf: &Conf, rx: Receiver<IngestEvent>) -> io::Result<()> {
     let fields = base_fields(conf);
     let id = fossick_index::list_buckets(&conf.data_dir)?.iter().map(|b| b.id + 1).max().unwrap_or(0);
     let mut hot = HotBucket::create(&conf.data_dir, id, fields.clone())?;
-    let time_source_id = (3 + conf.indexed_fields.len()) as u8;
     loop {
         match rx.recv_timeout(FLUSH_EVERY) {
             Ok(ev) => {
-                let mut metas: Vec<(u8, &[u8])> =
-                    vec![(0, ev.source.as_bytes()), (1, ev.sourcetype.as_bytes()), (2, ev.host.as_bytes())];
-                for (i, name) in conf.indexed_fields.iter().enumerate() {
-                    if let Some(val) = kv_extract(&ev.raw, name.as_bytes()) {
-                        metas.push((3 + i as u8, val));
-                    }
-                }
-                if ev.from_receipt {
-                    metas.push((time_source_id, b"receipt"));
-                }
+                let metas = event_metas(conf, &ev);
                 hot.add_event(ev.time_ms, &metas, &ev.raw)?;
                 if hot.should_roll(&limits) {
                     let next_id = hot.man.id + 1;
@@ -193,6 +376,21 @@ pub fn run_indexer(conf: &Conf, rx: Receiver<IngestEvent>) -> io::Result<()> {
             Err(RecvTimeoutError::Disconnected) => return hot.flush(),
         }
     }
+}
+
+fn event_metas<'a>(conf: &'a Conf, ev: &'a IngestEvent) -> Vec<(u8, &'a [u8])> {
+    let time_source_id = (3 + conf.indexed_fields.len()) as u8;
+    let mut metas: Vec<(u8, &[u8])> =
+        vec![(0, ev.source.as_bytes()), (1, ev.sourcetype.as_bytes()), (2, ev.host.as_bytes())];
+    for (i, name) in conf.indexed_fields.iter().enumerate() {
+        if let Some(val) = kv_extract(&ev.raw, name.as_bytes()) {
+            metas.push((3 + i as u8, val));
+        }
+    }
+    if ev.from_receipt {
+        metas.push((time_source_id, b"receipt"));
+    }
+    metas
 }
 
 /// Find `name=value` or `name="value"` in a raw line (index-time kv fields).
@@ -232,6 +430,137 @@ mod tests {
         send_line(line, &source, &st, &host, &tx).unwrap();
         let ev = rx.recv().unwrap();
         assert_eq!(ev.raw, line);
+    }
+
+    #[test]
+    fn handle_conn_stops_under_continuous_writes_when_shutdown() {
+        use std::time::Instant;
+        let shutdown = Shutdown::new();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let input = TcpInput { port: 0, source: "s".into(), sourcetype: "st".into(), host: "h".into() };
+        let conn_shutdown = shutdown.clone();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let _ = stream.set_nonblocking(false);
+            handle_conn(stream, &input, 4096, tx, conn_shutdown);
+        });
+        let writer = std::thread::spawn(move || {
+            let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            use std::io::Write;
+            let mut i = 0u32;
+            while i < 10_000 {
+                if writeln!(client, "2026-09-15T10:00:00Z busy_write_{}", i).is_err() {
+                    break;
+                }
+                i += 1;
+            }
+        });
+        std::thread::sleep(Duration::from_millis(30));
+        shutdown.request();
+        let t0 = Instant::now();
+        server.join().unwrap();
+        assert!(t0.elapsed() < DRAIN_BUDGET + Duration::from_secs(1), "handle_conn hung after shutdown");
+        writer.join().unwrap();
+        let mut indexed = 0;
+        while rx.try_recv().is_ok() {
+            indexed += 1;
+        }
+        assert!(indexed > 0, "expected some events before shutdown cut-off");
+    }
+
+    #[test]
+    fn handle_conn_indexes_partial_line_on_shutdown() {
+        let shutdown = Shutdown::new();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let input = TcpInput { port: 0, source: "s".into(), sourcetype: "st".into(), host: "h".into() };
+        let conn_shutdown = shutdown.clone();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let _ = stream.set_nonblocking(false);
+            handle_conn(stream, &input, 4096, tx, conn_shutdown);
+        });
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        use std::io::Write;
+        client.write_all(b"2026-09-15T10:00:00Z partial_no_newline").unwrap();
+        client.flush().unwrap();
+        std::thread::sleep(READ_POLL + Duration::from_millis(50));
+        shutdown.request();
+        server.join().unwrap();
+        let ev = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(ev.raw.windows(b"partial_no_newline".len()).any(|w| w == b"partial_no_newline"));
+    }
+
+    #[test]
+    fn handle_conn_exits_when_shutdown_requested_without_eof() {
+        let shutdown = Shutdown::new();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let input = TcpInput { port: 0, source: "s".into(), sourcetype: "st".into(), host: "h".into() };
+        let conn_shutdown = shutdown.clone();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let _ = stream.set_nonblocking(false);
+            handle_conn(stream, &input, 4096, tx, conn_shutdown);
+        });
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        use std::io::Write;
+        writeln!(client, "2026-09-15T10:00:00Z keepalive_line").unwrap();
+        client.flush().unwrap();
+        let ev = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(ev.raw.windows(b"keepalive_line".len()).any(|w| w == b"keepalive_line"));
+        shutdown.request();
+        server.join().unwrap();
+        drop(rx);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sigterm_requests_shutdown() {
+        let shutdown = Shutdown::new();
+        install_shutdown_handler(shutdown.clone());
+        // SAFETY: raises SIGTERM in-process; handler only sets an atomic bool.
+        unsafe {
+            libc::raise(libc::SIGTERM);
+        }
+        for _ in 0..100 {
+            if shutdown.requested() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("SIGTERM did not set shutdown flag");
+    }
+
+    #[test]
+    fn shutdown_stops_listener_accept_loop() {
+        let shutdown = Shutdown::new();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let input = TcpInput { port: 0, source: "s".into(), sourcetype: "st".into(), host: "h".into() };
+        let handle = spawn_listener(listener, input, 4096, tx, shutdown.clone());
+        shutdown.request();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn indexer_final_flush_persists_without_periodic_timer() {
+        let dir = std::env::temp_dir().join(format!("fossick-shutdown-flush-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let conf = Conf { data_dir: dir, ..Conf::default() };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let source: Arc<str> = "s".into();
+        let st: Arc<str> = "st".into();
+        let host: Arc<str> = "h".into();
+        send_line(b"2026-09-15T10:00:00Z shutdown_flush_marker", &source, &st, &host, &tx).unwrap();
+        drop(tx);
+        run_indexer(&conf, rx).unwrap();
+        let hits = crate::search::collect(&conf.data_dir, "shutdown_flush_marker", tstamp::now_ms()).unwrap();
+        assert_eq!(hits.len(), 1);
     }
 
     #[test]

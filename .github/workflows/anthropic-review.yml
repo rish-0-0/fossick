@@ -24,6 +24,7 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.pull_request.user.login != 'dependabot[bot]'
     steps:
+      - uses: actions/checkout@v4
       - name: Run Claude code review
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -101,8 +102,10 @@ jobs:
           Workflow-only PRs (diff only `.github/workflows/` and/or `docs/`): PASS when workflow and docs
           agree (secrets, model, limits); do not FAIL on stale GitHub PR description text alone.
 
-          Output ONLY valid JSON (no markdown fences, no prose before/after) with exactly:
-          {"verdict":"PASS"|"FAIL","summary":"<markdown for the PR comment>"}
+          Output ONLY valid JSON (no markdown fences, no prose before/after) as a single line.
+          Use \\n inside the summary string for line breaks (no literal newlines inside the JSON).
+          Keep summary under 2500 characters so the response is not truncated.
+          Schema: {"verdict":"PASS"|"FAIL","summary":"<markdown for the PR comment>"}
           The summary should be concise markdown: headings for Critical / Suggestions / Nits as appropriate.
           EOF
 
@@ -124,7 +127,7 @@ jobs:
             --rawfile user "$USER_FILE" \
             '{
               model: $model,
-              max_tokens: 4096,
+              max_tokens: 8192,
               system: $system,
               messages: [{role: "user", content: $user}]
             }' > "$PAYLOAD_FILE"
@@ -164,13 +167,19 @@ jobs:
             exit 1
           fi
 
-          CLEAN_JSON=$(printf '%s' "$MODEL_TEXT" | python3 -c 'import sys,re; t=sys.stdin.read(); m=re.search(r"\{.*\}", t, re.S); print(m.group(0) if m else "")')
+          PARSE_PY="${GITHUB_WORKSPACE}/.github/scripts/parse-anthropic-review.py"
+          if [ ! -f "$PARSE_PY" ]; then
+            echo "::error::Missing $PARSE_PY"
+            exit 1
+          fi
+          CLEAN_JSON=$(printf '%s' "$MODEL_TEXT" | python3 "$PARSE_PY") || CLEAN_JSON=""
 
           VERDICT=$(printf '%s' "$CLEAN_JSON" | jq -r '.verdict // empty' 2>/dev/null || true)
           SUMMARY=$(printf '%s' "$CLEAN_JSON" | jq -r '.summary // empty' 2>/dev/null || true)
 
           if [ -z "$VERDICT" ] || [ -z "$SUMMARY" ]; then
             echo "::error::Could not parse model JSON (verdict/summary)."
+            printf '%s\n' "$MODEL_TEXT" | head -c 2000 >&2 || true
             exit 1
           fi
 
