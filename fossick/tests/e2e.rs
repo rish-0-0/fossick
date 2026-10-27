@@ -368,7 +368,7 @@ fn serve_sigterm_drains_ingested_events() {
 
     let bin = env!("CARGO_BIN_EXE_fossick");
     assert!(std::path::Path::new(bin).exists(), "fossick binary missing at {bin}");
-    let mut child = Command::new(bin)
+    let child = Command::new(bin)
         .args(["serve", "--conf", &conf_path.to_string_lossy()])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -392,23 +392,14 @@ fn serve_sigterm_drains_ingested_events() {
         writeln!(client, "2026-09-15T10:00:{:02}Z sigterm_proc_{}", i % 60, i).unwrap();
     }
     client.flush().unwrap();
-    let conf = Conf { data_dir: dir.clone(), api_port: 0, indexed_fields: vec![], ..Conf::default() };
-    let now = tstamp::now_ms();
-    let mut indexed = false;
-    for _ in 0..60 {
-        if !search::collect(&conf.data_dir, "sigterm_proc_0", now).unwrap().is_empty() {
-            indexed = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    assert!(indexed, "events never reached the indexer before SIGTERM");
 
-    child.kill().expect("SIGTERM");
+    serve::send_sigterm_to_process(child.id()).expect("SIGTERM");
     let out = child.wait_with_output().expect("wait");
+    assert!(out.status.success(), "serve should exit 0 after SIGTERM drain");
     drop(client);
 
-    let hits = search::collect(&conf.data_dir, "sigterm_proc_", now).unwrap();
+    let conf = Conf { data_dir: dir, api_port: 0, indexed_fields: vec![], ..Conf::default() };
+    let hits = search::collect(&conf.data_dir, "sigterm_proc_", tstamp::now_ms()).unwrap();
     assert_eq!(
         hits.len(),
         N,

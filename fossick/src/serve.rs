@@ -59,6 +59,16 @@ pub fn install_shutdown_handler(shutdown: Shutdown) {
     shutdown_signals::install(shutdown);
 }
 
+/// Send SIGTERM to a child `fossick serve` process (Unix only).
+#[cfg(unix)]
+pub fn send_sigterm_to_process(pid: u32) -> io::Result<()> {
+    // SAFETY: `kill` with SIGTERM is the standard graceful-stop syscall.
+    if unsafe { libc::kill(pid as i32, libc::SIGTERM) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 mod shutdown_signals {
     use super::Shutdown;
@@ -229,11 +239,15 @@ pub fn handle_conn(
     let mut chunk = [0u8; 64 * 1024];
     let mut first_line = true;
     let mut skipping_oversize = false;
+    let mut draining = false;
     loop {
+        if shutdown.requested() {
+            draining = true;
+        }
         let n = match stream.read(&mut chunk) {
             Ok(0) => break,
             Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
-                if shutdown.requested() {
+                if draining {
                     break;
                 }
                 continue;
@@ -417,13 +431,16 @@ mod tests {
             let _ = stream.set_nonblocking(false);
             handle_conn(stream, &input, 4096, tx, conn_shutdown);
         });
+        let stop = shutdown.clone();
         let writer = std::thread::spawn(move || {
             let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
             use std::io::Write;
-            for i in 0..500 {
+            let mut i = 0u32;
+            while !stop.requested() {
                 if writeln!(client, "2026-09-15T10:00:00Z busy_write_{}", i).is_err() {
                     break;
                 }
+                i += 1;
             }
         });
         std::thread::sleep(Duration::from_millis(30));
