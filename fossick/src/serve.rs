@@ -461,10 +461,7 @@ mod tests {
         shutdown.request();
         let t0 = Instant::now();
         server.join().unwrap();
-        assert!(
-            t0.elapsed() < DRAIN_BUDGET + Duration::from_secs(1),
-            "handle_conn hung after shutdown"
-        );
+        assert!(t0.elapsed() < DRAIN_BUDGET + Duration::from_secs(1), "handle_conn hung after shutdown");
         writer.join().unwrap();
         let mut indexed = 0;
         while rx.try_recv().is_ok() {
