@@ -24,6 +24,7 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.pull_request.user.login != 'dependabot[bot]'
     steps:
+      - uses: actions/checkout@v4
       - name: Run Claude code review
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -166,44 +167,12 @@ jobs:
             exit 1
           fi
 
-          CLEAN_JSON=$(printf '%s' "$MODEL_TEXT" | python3 -c '
-          import json, re, sys
-
-          def fallback_obj(raw: str):
-              vm = re.search(r"\"verdict\"\s*:\s*\"(PASS|FAIL)\"", raw)
-              if not vm:
-                  return None
-              sm = re.search(r"\"summary\"\s*:\s*\"", raw)
-              if not sm:
-                  return {"verdict": vm.group(1), "summary": "(summary missing from model output)"}
-              rest = raw[sm.end() :]
-              end = len(rest)
-              for pat in (r"\"\s*\}\s*$", r"\"\s*,\s*\"verdict\""):
-                  m = re.search(pat, rest)
-                  if m:
-                      end = m.start()
-                      break
-              summary = rest[:end].replace("\\\\n", "\n").replace("\\n", "\n").replace("\\\"", '"')
-              return {"verdict": vm.group(1), "summary": summary}
-
-          text = sys.stdin.read().strip()
-          fenced = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.S)
-          if fenced:
-              text = fenced.group(1)
-          else:
-              start = text.find("{")
-              if start < 0:
-                  sys.exit(1)
-              text = text[start:]
-          obj = None
-          try:
-              obj, _ = json.JSONDecoder().raw_decode(text)
-          except json.JSONDecodeError:
-              obj = fallback_obj(text)
-          if not obj or not isinstance(obj.get("verdict"), str) or not isinstance(obj.get("summary"), str):
-              sys.exit(1)
-          print(json.dumps(obj))
-          ') || CLEAN_JSON=""
+          PARSE_PY="${GITHUB_WORKSPACE}/.github/scripts/parse-anthropic-review.py"
+          if [ ! -f "$PARSE_PY" ]; then
+            echo "::error::Missing $PARSE_PY"
+            exit 1
+          fi
+          CLEAN_JSON=$(printf '%s' "$MODEL_TEXT" | python3 "$PARSE_PY") || CLEAN_JSON=""
 
           VERDICT=$(printf '%s' "$CLEAN_JSON" | jq -r '.verdict // empty' 2>/dev/null || true)
           SUMMARY=$(printf '%s' "$CLEAN_JSON" | jq -r '.summary // empty' 2>/dev/null || true)
