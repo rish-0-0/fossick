@@ -3,9 +3,10 @@
 //! `[limits] max_line_bytes` (default 1 MiB) are truncated before indexing.
 //!
 //! **Graceful shutdown:** `fossick serve` installs a SIGINT/SIGTERM handler that
-//! stops accepting new TCP connections, lets in-flight readers finish, drains the
-//! ingest queue, flushes the hot bucket, then exits. Abrupt kill (`kill -9`) may
-//! lose at most the current unflushed journal block.
+//! stops accepting new TCP connections (the accept backlog is drained once),
+//! closes idle long-lived ingest reads, drains the ingest queue, flushes the hot
+//! bucket, then exits. The HTTP API thread is not joined (loopback-only today).
+//! Abrupt kill (`kill -9`) may lose at most the current unflushed journal block.
 //!
 //! **UTF-8 policy:** ingest treats each line as opaque bytes. Invalid UTF-8 is
 //! stored verbatim in the journal; search/API display uses lossy UTF-8 conversion
@@ -24,6 +25,7 @@ use std::time::Duration;
 
 const FLUSH_EVERY: Duration = Duration::from_secs(1);
 const ACCEPT_POLL: Duration = Duration::from_millis(50);
+const READ_POLL: Duration = Duration::from_millis(100);
 
 /// Cooperative shutdown flag shared by listeners and `fossick serve`.
 #[derive(Clone)]
@@ -75,13 +77,9 @@ mod shutdown_signals {
 
     pub fn install(shutdown: Shutdown) {
         let _ = FLAG.set(shutdown.flag);
-        let sa = libc::sigaction {
-            sa_sigaction: on_signal as *const () as usize,
-            sa_mask: empty_sigset(),
-            sa_flags: SA_RESTART,
-            sa_restorer: None,
-        };
+        let sa = new_sigaction();
         for sig in [SIGINT, SIGTERM] {
+            // SAFETY: `sa` points at a valid `sigaction`; prior handlers are replaced.
             if unsafe { sigaction(sig, &sa, std::ptr::null_mut()) } != 0 {
                 eprintln!("fossick: warning: could not install handler for signal {sig}");
             }
@@ -89,8 +87,21 @@ mod shutdown_signals {
         eprintln!("fossick: press Ctrl+C or send SIGTERM for graceful shutdown");
     }
 
+    fn new_sigaction() -> libc::sigaction {
+        let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
+        sa.sa_sigaction = on_signal as *const () as usize;
+        sa.sa_mask = empty_sigset();
+        sa.sa_flags = SA_RESTART;
+        #[cfg(target_os = "linux")]
+        {
+            sa.sa_restorer = None;
+        }
+        sa
+    }
+
     fn empty_sigset() -> sigset_t {
         let mut set = MaybeUninit::<sigset_t>::uninit();
+        // SAFETY: `sigemptyset` initializes `set` on success (always for a fresh set).
         unsafe {
             sigemptyset(set.as_mut_ptr());
             set.assume_init()
@@ -156,9 +167,11 @@ pub fn spawn_listener(
     std::thread::spawn(move || {
         let _ = listener.set_nonblocking(true);
         let accept_one = |stream: TcpStream| {
+            let _ = stream.set_nonblocking(false);
             let input = input.clone();
             let tx = tx.clone();
-            std::thread::spawn(move || handle_conn(stream, &input, max_line_bytes, tx));
+            let conn_shutdown = shutdown.clone();
+            std::thread::spawn(move || handle_conn(stream, &input, max_line_bytes, tx, conn_shutdown));
         };
         while !shutdown.requested() {
             match listener.accept() {
@@ -176,8 +189,15 @@ pub fn spawn_listener(
     })
 }
 
-/// Read newline-delimited events from one connection until EOF.
-pub fn handle_conn(mut stream: TcpStream, input: &TcpInput, max_line_bytes: usize, tx: Sender<IngestEvent>) {
+/// Read newline-delimited events from one connection until EOF or graceful shutdown.
+pub fn handle_conn(
+    mut stream: TcpStream,
+    input: &TcpInput,
+    max_line_bytes: usize,
+    tx: Sender<IngestEvent>,
+    shutdown: Shutdown,
+) {
+    let _ = stream.set_read_timeout(Some(READ_POLL));
     let peer = stream.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
     let mut source: Arc<str> = input.source.as_str().into();
     let mut sourcetype: Arc<str> = input.sourcetype.as_str().into();
@@ -189,7 +209,14 @@ pub fn handle_conn(mut stream: TcpStream, input: &TcpInput, max_line_bytes: usiz
     let mut skipping_oversize = false;
     loop {
         let n = match stream.read(&mut chunk) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
+                if shutdown.requested() {
+                    break;
+                }
+                continue;
+            }
+            Err(_) => break,
             Ok(n) => n,
         };
         buf.extend_from_slice(&chunk[..n]);
@@ -295,12 +322,7 @@ pub fn run_indexer(conf: &Conf, rx: Receiver<IngestEvent>) -> io::Result<()> {
                 }
             }
             Err(RecvTimeoutError::Timeout) => hot.flush()?,
-            Err(RecvTimeoutError::Disconnected) => {
-                while let Ok(ev) = rx.try_recv() {
-                    hot.add_event(ev.time_ms, &event_metas(conf, &ev), &ev.raw)?;
-                }
-                return hot.flush();
-            }
+            Err(RecvTimeoutError::Disconnected) => return hot.flush(),
         }
     }
 }
@@ -357,6 +379,48 @@ mod tests {
         send_line(line, &source, &st, &host, &tx).unwrap();
         let ev = rx.recv().unwrap();
         assert_eq!(ev.raw, line);
+    }
+
+    #[test]
+    fn handle_conn_exits_when_shutdown_requested_without_eof() {
+        let shutdown = Shutdown::new();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let input = TcpInput { port: 0, source: "s".into(), sourcetype: "st".into(), host: "h".into() };
+        let conn_shutdown = shutdown.clone();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let _ = stream.set_nonblocking(false);
+            handle_conn(stream, &input, 4096, tx, conn_shutdown);
+        });
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        use std::io::Write;
+        writeln!(client, "2026-09-15T10:00:00Z keepalive_line").unwrap();
+        client.flush().unwrap();
+        let ev = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(ev.raw.windows(b"keepalive_line".len()).any(|w| w == b"keepalive_line"));
+        shutdown.request();
+        server.join().unwrap();
+        drop(rx);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sigterm_requests_shutdown() {
+        let shutdown = Shutdown::new();
+        install_shutdown_handler(shutdown.clone());
+        // SAFETY: raises SIGTERM in-process; handler only sets an atomic bool.
+        unsafe {
+            libc::raise(libc::SIGTERM);
+        }
+        for _ in 0..100 {
+            if shutdown.requested() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("SIGTERM did not set shutdown flag");
     }
 
     #[test]

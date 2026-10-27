@@ -23,7 +23,7 @@ fn ingest(conf: &Conf, input: TcpInput, header: Option<&str>, lines: &[String]) 
     let max_line_bytes = conf.max_line_bytes;
     let acceptor = std::thread::spawn(move || {
         let (stream, _) = listener.accept().unwrap();
-        serve::handle_conn(stream, &conn_input, max_line_bytes, tx); // tx dropped when conn closes
+        serve::handle_conn(stream, &conn_input, max_line_bytes, tx, serve::Shutdown::new());
     });
     let indexer = {
         let conf = conf.clone();
@@ -248,7 +248,7 @@ fn invalid_utf8_preserves_bytes_through_index_and_search() {
     let max_line_bytes = conf.max_line_bytes;
     let acceptor = std::thread::spawn(move || {
         let (stream, _) = listener.accept().unwrap();
-        serve::handle_conn(stream, &conn_input, max_line_bytes, tx);
+        serve::handle_conn(stream, &conn_input, max_line_bytes, tx, serve::Shutdown::new());
     });
     let indexer = {
         let conf = conf.clone();
@@ -295,7 +295,7 @@ fn crlf_blank_lines_and_no_trailing_newline() {
     let max_line_bytes = conf.max_line_bytes;
     let acceptor = std::thread::spawn(move || {
         let (stream, _) = listener.accept().unwrap();
-        serve::handle_conn(stream, &conn_input, max_line_bytes, tx);
+        serve::handle_conn(stream, &conn_input, max_line_bytes, tx, serve::Shutdown::new());
     });
     let indexer = {
         let conf = conf.clone();
@@ -335,8 +335,9 @@ fn graceful_shutdown_drains_in_flight_events() {
     client.flush().unwrap();
     shutdown.request();
     listener_thread.join().unwrap();
-    drop(client);
+    // Client stays open (long-lived shipper); readers must still exit and drain.
     indexer.join().unwrap().unwrap();
+    drop(client);
 
     let hits = search::collect(&conf.data_dir, "graceful_evt_", tstamp::now_ms()).unwrap();
     assert_eq!(hits.len(), N);
