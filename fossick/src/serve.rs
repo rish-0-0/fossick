@@ -4,7 +4,7 @@
 //!
 //! **Graceful shutdown:** `fossick serve` installs a SIGINT/SIGTERM handler that
 //! stops accepting new TCP connections (the accept backlog is drained once),
-//! closes idle long-lived ingest reads, drains the ingest queue, flushes the hot
+//! reads until each ingest socket is idle, drains the ingest queue, flushes the hot
 //! bucket, then exits. The HTTP API thread is not joined (loopback-only today).
 //! Abrupt kill (`kill -9`) may lose at most the current unflushed journal block.
 //!
@@ -25,7 +25,8 @@ use std::time::Duration;
 
 const FLUSH_EVERY: Duration = Duration::from_secs(1);
 const ACCEPT_POLL: Duration = Duration::from_millis(50);
-const READ_POLL: Duration = Duration::from_millis(100);
+/// Read poll interval for ingest connections (exported for integration tests).
+pub const READ_POLL: Duration = Duration::from_millis(100);
 
 /// Cooperative shutdown flag shared by listeners and `fossick serve`.
 #[derive(Clone)]
@@ -174,9 +175,15 @@ pub fn spawn_listener(
     shutdown: Shutdown,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
-        let _ = listener.set_nonblocking(true);
+        if listener.set_nonblocking(true).is_err() {
+            eprintln!("fossick: cannot set listener non-blocking; ingest thread exiting");
+            return;
+        }
         let accept_one = |stream: TcpStream| {
-            let _ = stream.set_nonblocking(false);
+            if stream.set_nonblocking(false).is_err() {
+                eprintln!("fossick: cannot set connection blocking; dropping client");
+                return;
+            }
             let input = input.clone();
             let tx = tx.clone();
             let conn_shutdown = shutdown.clone();
@@ -209,7 +216,10 @@ pub fn handle_conn(
     tx: Sender<IngestEvent>,
     shutdown: Shutdown,
 ) {
-    let _ = stream.set_read_timeout(Some(READ_POLL));
+    if stream.set_read_timeout(Some(READ_POLL)).is_err() {
+        eprintln!("fossick: cannot set read timeout; closing ingest connection");
+        return;
+    }
     let peer = stream.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
     let mut source: Arc<str> = input.source.as_str().into();
     let mut sourcetype: Arc<str> = input.sourcetype.as_str().into();
@@ -275,9 +285,6 @@ pub fn handle_conn(
             let _ = send_line(&buf[..max_line_bytes], &source, &sourcetype, &host, &tx);
             buf.clear();
             skipping_oversize = true;
-        }
-        if shutdown.requested() {
-            break;
         }
     }
     // Trailing data without a final newline is still an event.
@@ -414,7 +421,9 @@ mod tests {
             let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
             use std::io::Write;
             for i in 0..500 {
-                writeln!(client, "2026-09-15T10:00:00Z busy_write_{}", i).unwrap();
+                if writeln!(client, "2026-09-15T10:00:00Z busy_write_{}", i).is_err() {
+                    break;
+                }
             }
         });
         std::thread::sleep(Duration::from_millis(30));
