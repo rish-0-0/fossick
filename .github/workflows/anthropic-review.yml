@@ -164,13 +164,33 @@ jobs:
             exit 1
           fi
 
-          CLEAN_JSON=$(printf '%s' "$MODEL_TEXT" | python3 -c 'import sys,re; t=sys.stdin.read(); m=re.search(r"\{.*\}", t, re.S); print(m.group(0) if m else "")')
+          CLEAN_JSON=$(printf '%s' "$MODEL_TEXT" | python3 -c '
+          import json, re, sys
+
+          text = sys.stdin.read().strip()
+          fenced = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.S)
+          if fenced:
+              text = fenced.group(1)
+          else:
+              start = text.find("{")
+              if start < 0:
+                  sys.exit(1)
+              text = text[start:]
+          try:
+              obj, _ = json.JSONDecoder().raw_decode(text)
+          except json.JSONDecodeError:
+              sys.exit(1)
+          if not isinstance(obj.get("verdict"), str) or not isinstance(obj.get("summary"), str):
+              sys.exit(1)
+          print(json.dumps(obj))
+          ') || CLEAN_JSON=""
 
           VERDICT=$(printf '%s' "$CLEAN_JSON" | jq -r '.verdict // empty' 2>/dev/null || true)
           SUMMARY=$(printf '%s' "$CLEAN_JSON" | jq -r '.summary // empty' 2>/dev/null || true)
 
           if [ -z "$VERDICT" ] || [ -z "$SUMMARY" ]; then
             echo "::error::Could not parse model JSON (verdict/summary)."
+            printf '%s\n' "$MODEL_TEXT" | head -c 2000 >&2 || true
             exit 1
           fi
 
