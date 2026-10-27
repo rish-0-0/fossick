@@ -63,19 +63,27 @@ mod shutdown_signals {
     use super::Shutdown;
     use libc::{c_int, sigaction, sigemptyset, sigset_t, SA_RESTART, SIGINT, SIGTERM};
     use std::mem::MaybeUninit;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, OnceLock};
 
     static FLAG: OnceLock<Arc<std::sync::atomic::AtomicBool>> = OnceLock::new();
+    static SIGNAL_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-    // SAFETY: async-signal-safe; only sets an atomic flag installed before handlers run.
-    extern "C" fn on_signal(_: c_int) {
+    extern "C" fn on_signal(sig: c_int) {
         if let Some(flag) = FLAG.get() {
             flag.store(true, Ordering::Release);
+        }
+        if SIGNAL_COUNT.fetch_add(1, Ordering::Relaxed) > 0 {
+            // SAFETY: restore default disposition then re-raise so a stuck drain stays killable.
+            unsafe {
+                libc::signal(sig, libc::SIG_DFL);
+                libc::raise(sig);
+            }
         }
     }
 
     pub fn install(shutdown: Shutdown) {
+        // Only the first `Shutdown` flag is wired; later installs are ignored.
         let _ = FLAG.set(shutdown.flag);
         let sa = new_sigaction();
         for sig in [SIGINT, SIGTERM] {
@@ -88,6 +96,7 @@ mod shutdown_signals {
     }
 
     fn new_sigaction() -> libc::sigaction {
+        // SAFETY: `sigaction` is zeroed then fully initialized before use.
         let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
         sa.sa_sigaction = on_signal as *const () as usize;
         sa.sa_mask = empty_sigset();
@@ -179,7 +188,10 @@ pub fn spawn_listener(
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     std::thread::sleep(ACCEPT_POLL);
                 }
-                Err(_) => break,
+                Err(e) => {
+                    eprintln!("fossick: accept error (retrying): {e}");
+                    std::thread::sleep(ACCEPT_POLL);
+                }
             }
         }
         // Accept connections already in the backlog so their readers keep a sender clone.
@@ -263,6 +275,9 @@ pub fn handle_conn(
             let _ = send_line(&buf[..max_line_bytes], &source, &sourcetype, &host, &tx);
             buf.clear();
             skipping_oversize = true;
+        }
+        if shutdown.requested() {
+            break;
         }
     }
     // Trailing data without a final newline is still an event.
@@ -379,6 +394,64 @@ mod tests {
         send_line(line, &source, &st, &host, &tx).unwrap();
         let ev = rx.recv().unwrap();
         assert_eq!(ev.raw, line);
+    }
+
+    #[test]
+    fn handle_conn_stops_under_continuous_writes_when_shutdown() {
+        use std::time::Instant;
+        let shutdown = Shutdown::new();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let input = TcpInput { port: 0, source: "s".into(), sourcetype: "st".into(), host: "h".into() };
+        let conn_shutdown = shutdown.clone();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let _ = stream.set_nonblocking(false);
+            handle_conn(stream, &input, 4096, tx, conn_shutdown);
+        });
+        let writer = std::thread::spawn(move || {
+            let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            use std::io::Write;
+            for i in 0..500 {
+                writeln!(client, "2026-09-15T10:00:00Z busy_write_{}", i).unwrap();
+            }
+        });
+        std::thread::sleep(Duration::from_millis(30));
+        shutdown.request();
+        let t0 = Instant::now();
+        server.join().unwrap();
+        assert!(t0.elapsed() < Duration::from_secs(2), "handle_conn hung after shutdown");
+        writer.join().unwrap();
+        let mut indexed = 0;
+        while rx.try_recv().is_ok() {
+            indexed += 1;
+        }
+        assert!(indexed > 0, "expected some events before shutdown cut-off");
+    }
+
+    #[test]
+    fn handle_conn_indexes_partial_line_on_shutdown() {
+        let shutdown = Shutdown::new();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let input = TcpInput { port: 0, source: "s".into(), sourcetype: "st".into(), host: "h".into() };
+        let conn_shutdown = shutdown.clone();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let _ = stream.set_nonblocking(false);
+            handle_conn(stream, &input, 4096, tx, conn_shutdown);
+        });
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        use std::io::Write;
+        client.write_all(b"2026-09-15T10:00:00Z partial_no_newline").unwrap();
+        client.flush().unwrap();
+        std::thread::sleep(READ_POLL + Duration::from_millis(50));
+        shutdown.request();
+        server.join().unwrap();
+        let ev = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(ev.raw.windows(b"partial_no_newline".len()).any(|w| w == b"partial_no_newline"));
     }
 
     #[test]

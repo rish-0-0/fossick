@@ -333,6 +333,7 @@ fn graceful_shutdown_drains_in_flight_events() {
         writeln!(client, "2026-09-15T10:00:{:02}Z graceful_evt_{}", i % 60, i).unwrap();
     }
     client.flush().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
     shutdown.request();
     listener_thread.join().unwrap();
     // Client stays open (long-lived shipper); readers must still exit and drain.
