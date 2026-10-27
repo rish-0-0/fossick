@@ -4,7 +4,8 @@
 //!
 //! **Graceful shutdown:** `fossick serve` installs a SIGINT/SIGTERM handler that
 //! stops accepting new TCP connections (the accept backlog is drained once),
-//! reads until each ingest socket is idle, drains the ingest queue, flushes the hot
+//! reads each ingest socket until idle or a post-shutdown drain budget elapses,
+//! drains the ingest queue, flushes the hot
 //! bucket, then exits. The HTTP API thread is not joined (loopback-only today).
 //! Abrupt kill (`kill -9`) may lose at most the current unflushed journal block.
 //!
@@ -27,6 +28,8 @@ const FLUSH_EVERY: Duration = Duration::from_secs(1);
 const ACCEPT_POLL: Duration = Duration::from_millis(50);
 /// Read poll interval for ingest connections (exported for integration tests).
 pub const READ_POLL: Duration = Duration::from_millis(100);
+/// Max time to keep reading an ingest socket after shutdown is requested.
+const DRAIN_BUDGET: Duration = Duration::from_secs(3);
 
 /// Cooperative shutdown flag shared by listeners and `fossick serve`.
 #[derive(Clone)]
@@ -240,13 +243,25 @@ pub fn handle_conn(
     let mut first_line = true;
     let mut skipping_oversize = false;
     let mut draining = false;
+    let mut drain_until = None;
     loop {
         if shutdown.requested() {
             draining = true;
+            if drain_until.is_none() {
+                drain_until = Some(std::time::Instant::now() + DRAIN_BUDGET);
+            }
+        }
+        if draining && drain_until.is_some_and(|t| std::time::Instant::now() >= t) {
+            break;
         }
         let n = match stream.read(&mut chunk) {
             Ok(0) => break,
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
+                ) =>
+            {
                 if draining {
                     break;
                 }
@@ -431,12 +446,11 @@ mod tests {
             let _ = stream.set_nonblocking(false);
             handle_conn(stream, &input, 4096, tx, conn_shutdown);
         });
-        let stop = shutdown.clone();
         let writer = std::thread::spawn(move || {
             let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
             use std::io::Write;
             let mut i = 0u32;
-            while !stop.requested() {
+            while i < 10_000 {
                 if writeln!(client, "2026-09-15T10:00:00Z busy_write_{}", i).is_err() {
                     break;
                 }
@@ -447,7 +461,10 @@ mod tests {
         shutdown.request();
         let t0 = Instant::now();
         server.join().unwrap();
-        assert!(t0.elapsed() < Duration::from_secs(2), "handle_conn hung after shutdown");
+        assert!(
+            t0.elapsed() < DRAIN_BUDGET + Duration::from_secs(1),
+            "handle_conn hung after shutdown"
+        );
         writer.join().unwrap();
         let mut indexed = 0;
         while rx.try_recv().is_ok() {
