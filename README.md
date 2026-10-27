@@ -90,6 +90,8 @@ Known gaps (documented, not silent): no `timechart`/`bin`/`eventstats`/
 Fields are auto-extracted from `_raw` as `key=value` at search time.
 Ingest stores raw bytes; invalid UTF-8 is preserved on disk but search/API strings
 use lossy conversion, so distinct invalid sequences may look identical in results.
+`fossick serve` handles SIGINT/SIGTERM by draining in-flight ingest and flushing the
+hot bucket before exit (`kill -9` may lose at most one unflushed journal block).
 
 ## Tests
 

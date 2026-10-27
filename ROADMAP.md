@@ -47,6 +47,8 @@ Make the storage engine trustworthy with real data volumes and real time.
       graceful shutdown with zero event loss.
       *Exit: loggen at sustained high rate with kill -9 mid-stream loses at
       most the unflushed block; metadata fields searchable.*
+      *Progress: graceful shutdown (SIGINT/SIGTERM drain + hot flush) shipped;
+      max line length + UTF-8 store-as-is + per-source metadata already in place.*
 - [ ] **Internal metrics**: ingest rate, bucket counts, search latency,
       exposed at `/api/metrics` and self-indexed into an `_internal` index.
       *Exit: `index=_internal | stats avg(ingest_eps)` works.*

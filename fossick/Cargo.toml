@@ -7,3 +7,4 @@ license.workspace = true
 [dependencies]
 fossick-index = { path = "../fossick-index" }
 fossick-spl = { path = "../fossick-spl" }
+libc = "0.2"

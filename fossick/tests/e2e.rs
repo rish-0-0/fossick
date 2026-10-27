@@ -314,6 +314,35 @@ fn crlf_blank_lines_and_no_trailing_newline() {
 }
 
 #[test]
+fn graceful_shutdown_drains_in_flight_events() {
+    let conf = test_conf("graceful-shutdown");
+    let shutdown = serve::Shutdown::new();
+    let input = TcpInput { port: 0, source: "s".into(), sourcetype: "st".into(), host: "h".into() };
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let listener_thread = serve::spawn_listener(listener, input, conf.max_line_bytes, tx, shutdown.clone());
+    let indexer = std::thread::spawn({
+        let conf = conf.clone();
+        move || serve::run_indexer(&conf, rx)
+    });
+
+    const N: usize = 150;
+    let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    for i in 0..N {
+        writeln!(client, "2026-09-15T10:00:{:02}Z graceful_evt_{}", i % 60, i).unwrap();
+    }
+    client.flush().unwrap();
+    shutdown.request();
+    listener_thread.join().unwrap();
+    drop(client);
+    indexer.join().unwrap().unwrap();
+
+    let hits = search::collect(&conf.data_dir, "graceful_evt_", tstamp::now_ms()).unwrap();
+    assert_eq!(hits.len(), N);
+}
+
+#[test]
 fn spl_api_returns_json_tables() {
     use std::io::Read;
     let conf = test_conf("spl-api");
